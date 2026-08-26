@@ -24,12 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   covers platforms whose watcher reports the staging of a swap but not the
   rename that completes it.
 
-### Note on 0.1.0
-
-`v0.1.0` was tagged and is fetchable from the module proxy, but it has no
-GitHub release: the workflows did not run for the push that created the
-repository, so the tag was never gated. It is superseded by this release.
-
 ## [0.1.0] - 2026-08-26
 
 ### Added
