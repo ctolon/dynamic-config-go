@@ -40,8 +40,12 @@ type Status struct {
 	// none has been.
 	LastFailure time.Time
 
-	// Watching reports whether a watcher currently owns the filesystem
-	// watch.
+	// Watching reports whether a watch is established — the directory is
+	// armed and changes are being observed. It is deliberately not "a
+	// call to Watch is in progress": between claiming the watcher slot
+	// and arming the watch there is a moment during which a change would
+	// be caught by the startup check rather than by an event, and
+	// reporting true there would promise something not yet true.
 	Watching bool
 
 	// Closed reports whether Close has been called.

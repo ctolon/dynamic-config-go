@@ -55,11 +55,17 @@ type Config[T any] struct {
 	// need not read Viper's fields while a reload writes them.
 	configFile atomic.Pointer[string]
 
-	// fileStamp is the size and modification time of the file at the last
-	// successful read. Watch compares it against the file on disk to
+	// fileStamp is the size, mode and modification time of the file at the
+	// last successful read. Watch compares it against the file on disk to
 	// close the gap between loading and watching without republishing a
 	// configuration that never changed.
 	fileStamp atomic.Pointer[fileStamp]
+
+	// watching reports that a watch is established, rather than merely
+	// claimed. Claiming happens first, so that a second Watch can be
+	// refused; the flag is what Status reports, because "watching" has to
+	// mean "changes are being observed" to be worth reporting at all.
+	watching atomic.Bool
 
 	// reloadSem serialises reload transactions. A one-slot channel rather
 	// than a sync.Mutex because acquisition has to be selectable against
@@ -121,7 +127,7 @@ func (c *Config[T]) Status() Status {
 		FailedReloads:     c.failedReloads.Load(),
 		LastSuccess:       loadTime(&c.lastSuccess),
 		LastFailure:       loadTime(&c.lastFailure),
-		Watching:          c.life.Watching(),
+		Watching:          c.watching.Load(),
 		Closed:            c.life.Closed(),
 		ConfigFile:        c.configFileUsed(),
 		DroppedEvents:     c.dispatcher.Dropped(),

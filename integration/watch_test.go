@@ -272,8 +272,13 @@ func TestDeletedFileKeepsSnapshotAndRecreationPublishes(t *testing.T) {
 func TestKubernetesProjectedVolumeUpdate(t *testing.T) {
 	t.Parallel()
 
-	if runtime.GOOS == "windows" {
-		t.Skip("projected volumes are a Linux container concern; symlink semantics differ on Windows")
+	if runtime.GOOS != "linux" {
+		// Projected volumes exist on Linux nodes and nowhere else, so
+		// this is verified where it runs. It is also not reproducible
+		// elsewhere: kqueue follows a watched symlink to its target, so
+		// renaming a new link over ..data touches nothing the watcher
+		// holds and produces no event at all on macOS.
+		t.Skip("Kubernetes projected volumes are a Linux mechanism")
 	}
 
 	dir := t.TempDir()
@@ -360,6 +365,64 @@ func TestChangeBetweenLoadAndWatchIsNotMissed(t *testing.T) {
 	waitForValue(t, cfg, "changed-in-the-gap")
 }
 
+func TestPermissionChangeBeforeWatchIsNotMissed(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits do not apply")
+	}
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this test relies on")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+
+	write(t, path, document("loaded", 8080))
+
+	cfg, err := dynamicconfig.New[config](
+		dynamicconfig.WithConfigFile[config](path),
+		dynamicconfig.WithValidator(validate),
+		dynamicconfig.WithDebounce[config](20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = cfg.Close() }()
+
+	failures := make(chan dynamicconfig.ReloadError, 8)
+
+	cfg.SubscribeErrors(func(e dynamicconfig.ReloadError) {
+		select {
+		case failures <- e:
+		default:
+		}
+	})
+
+	// A change in the gap between loading and watching that leaves the
+	// modification time alone. Only the mode moved, so this is what the
+	// stamp has to notice for the gap check to be worth having.
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = cfg.Watch(ctx) }()
+
+	waitForFailure(t, failures, dynamicconfig.StageRead)
+
+	if cfg.Current().Value != "loaded" {
+		t.Fatal("an unreadable file disturbed the published snapshot")
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod back: %v", err)
+	}
+}
+
 func TestUnchangedFileDoesNotRepublishOnWatch(t *testing.T) {
 	t.Parallel()
 
@@ -385,26 +448,45 @@ func TestRapidWritesCoalesce(t *testing.T) {
 
 	write(t, path, document("first", 8080))
 
-	cfg, _ := start(t, path, dynamicconfig.WithDebounce[config](250*time.Millisecond))
+	const (
+		writes   = 25
+		debounce = 250 * time.Millisecond
+	)
 
-	for i := range 25 {
+	cfg, _ := start(t, path, dynamicconfig.WithDebounce[config](debounce))
+
+	began := time.Now()
+
+	for i := range writes {
 		write(t, path, document("burst", 9000+i))
 
 		time.Sleep(2 * time.Millisecond)
 	}
 
+	burst := time.Since(began)
+
 	waitFor(t, func() bool { return cfg.Current().Port == 9024 }, "the last write to be published")
 
-	// One logical change, one reload. A handful of extra reloads would
-	// mean the debounce window is not doing its job; dozens would mean it
-	// is not there at all.
-	if got := cfg.Status().SuccessfulReloads; got > 3 {
-		t.Fatalf("successful reloads = %d for one burst of writes", got)
+	// A debounce window retires at most one reload, so a burst spanning n
+	// windows can produce at most n reloads plus one for the tail. On a
+	// machine quick enough to write all of this inside one window — which
+	// is the case the debounce exists for — that bound is one reload for
+	// twenty-five writes. On a loaded CI runner under -race the burst
+	// genuinely spans several windows, and the same arithmetic still
+	// holds, which is what makes this an assertion about coalescing
+	// rather than about the machine it runs on.
+	limit := uint64(burst/debounce) + 2
+
+	if got := cfg.Status().SuccessfulReloads; got > limit {
+		t.Fatalf("successful reloads = %d for %d writes spanning %s (limit %d)",
+			got, writes, burst.Round(time.Millisecond), limit)
 	}
 }
 
 func TestEventStormIsBounded(t *testing.T) {
-	t.Parallel()
+	// Deliberately not parallel. It counts goroutines, and
+	// runtime.NumGoroutine is a property of the process rather than of a
+	// test, so a sibling running alongside would be measured too.
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 
@@ -420,13 +502,14 @@ func TestEventStormIsBounded(t *testing.T) {
 
 	waitFor(t, func() bool { return cfg.Current().Value == "storm" }, "the storm to be published")
 
-	time.Sleep(300 * time.Millisecond)
-
 	// The point of coalescing: an unbounded event rate must not produce
-	// an unbounded amount of anything.
-	if grown := runtime.NumGoroutine() - goroutinesBefore; grown > 10 {
-		t.Fatalf("goroutines grew by %d during an event storm", grown)
-	}
+	// an unbounded amount of anything. What is asserted is that the count
+	// comes back down, not that it never rose — a reload in flight owns a
+	// goroutine or two by design, and a sample taken at an arbitrary
+	// instant would be measuring the scheduler.
+	waitFor(t, func() bool {
+		return runtime.NumGoroutine()-goroutinesBefore <= 10
+	}, "goroutines to settle back to their baseline after the storm")
 
 	if got := cfg.Status().SuccessfulReloads; got > 300 {
 		t.Fatalf("successful reloads = %d, more than the number of writes", got)

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Status().Watching` now reports an *established* watch rather than a
+  claimed one. It used to become true the moment `Watch` took the watcher
+  slot, which is before the directory is armed — so a caller that waited
+  for it could act in a window where changes were not yet being observed.
+- The startup check that closes the gap between loading and watching now
+  notices a mode change. It compared size and modification time, and a
+  `chmod` moves neither, so a file made unreadable in that window went
+  unreported until the next write.
+- Kubernetes projected-volume detection now matches the whole `..`-prefixed
+  family — `..data`, `..data_tmp` and the staged `..<timestamp>` directory —
+  rather than `..data` alone. Every name the mechanism uses starts with two
+  dots and nothing else in a configuration directory does, so this also
+  covers platforms whose watcher reports the staging of a swap but not the
+  rename that completes it.
+
+### Note on 0.1.0
+
+`v0.1.0` was tagged and is fetchable from the module proxy, but it has no
+GitHub release: the workflows did not run for the push that created the
+repository, so the tag was never gated. It is superseded by this release.
+
 ## [0.1.0] - 2026-08-26
 
 ### Added

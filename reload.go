@@ -205,9 +205,14 @@ func (c *Config[T]) tolerateMissingFile(err error) bool {
 
 // fileStamp identifies a file version cheaply, without reading it and
 // without holding anything that could be a secret.
+//
+// Mode is part of it because a chmod is a change the next read cares about
+// and the modification time does not record: making a file unreadable
+// leaves its mtime alone.
 type fileStamp struct {
 	size    int64
 	modTime int64
+	mode    uint32
 }
 
 func (c *Config[T]) recordFileStamp() {
@@ -230,7 +235,11 @@ func statStamp(path string) (*fileStamp, error) {
 		return nil, err
 	}
 
-	return &fileStamp{size: info.Size(), modTime: info.ModTime().UnixNano()}, nil
+	return &fileStamp{
+		size:    info.Size(),
+		modTime: info.ModTime().UnixNano(),
+		mode:    uint32(info.Mode()),
+	}, nil
 }
 
 // fileChangedSinceLoad reports whether the file on disk differs from the

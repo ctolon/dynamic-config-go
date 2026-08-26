@@ -20,9 +20,12 @@ sees a half-published ConfigMap — and it is the only event the update
 produces. `config.yaml` is never written to.
 
 A watcher that watches `config.yaml` for writes therefore sees nothing at
-all. This package watches the directory and treats a `..data` event as an
-event for the file, which is the only thing that makes hot reload work in a
-pod. There is an integration test that builds exactly the layout above,
+all. This package watches the directory and treats an event for any
+`..`-prefixed name — `..data`, the `..data_tmp` link used to perform the
+swap, and the staged `..<timestamp>` directory — as an event for the
+configuration file. Every name the mechanism uses starts with two dots and
+nothing else in a configuration directory does, which is what makes hot
+reload work in a pod. There is an integration test that builds exactly the layout above,
 performs the swap, and asserts that a new snapshot is published.
 
 ## The manifest

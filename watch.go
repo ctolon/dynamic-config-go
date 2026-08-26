@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,11 +14,19 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// kubernetesDataDir is the symlink a projected volume swaps atomically when
-// a ConfigMap or Secret is updated. The configuration file in such a mount
-// is a symlink into it, so the interesting event names the link, not the
-// file.
-const kubernetesDataDir = "..data"
+// projectedVolumePrefix is what every name a Kubernetes projected volume
+// creates begins with: the staged data directory (..2026_08_26_10_00_00),
+// the symlink swapped atomically over it (..data) and the temporary link
+// used to perform the swap (..data_tmp).
+//
+// The configuration file in such a mount is a symlink into ..data, so it
+// never receives an event of its own — the interesting events all name one
+// of these instead. Nothing else in a configuration directory starts with
+// two dots, which is what makes the prefix a safe signal rather than a
+// guess. Matching the whole family rather than ..data alone also covers
+// platforms whose watcher reports the staging of a swap but not the rename
+// that completes it.
+const projectedVolumePrefix = ".."
 
 // rewatchInterval is how often the watcher tries to re-establish a watch on
 // a directory that disappeared. Deliberately unhurried: the case is rare
@@ -131,6 +140,13 @@ func (c *Config[T]) watch(ctx context.Context, path string) error {
 	if c.fileChangedSinceLoad() {
 		debouncer.Trigger()
 	}
+
+	// Only now is the watch real: the directory is armed and the gap
+	// between loading and watching has been closed. Status says so from
+	// here, not from the moment the watcher slot was claimed.
+	c.watching.Store(true)
+
+	defer c.watching.Store(false)
 
 	err = c.watchLoop(watchCtx, watcher, path, dir, debouncer)
 
@@ -255,9 +271,9 @@ func relevant(event fsnotify.Event, path, dir string) bool {
 		return true
 	}
 
-	// A projected volume publishes through a swapped ..data symlink; the
-	// file inside it never receives an event of its own.
-	if filepath.Base(name) == kubernetesDataDir {
+	// A projected volume publishes through its own ..-prefixed machinery
+	// rather than by writing to the file.
+	if strings.HasPrefix(filepath.Base(name), projectedVolumePrefix) {
 		return true
 	}
 
