@@ -3,7 +3,7 @@ module github.com/ctolon/dynamic-config-go
 go 1.24
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/spf13/viper v1.21.0
 )
 
