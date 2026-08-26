@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)publish, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # A Go module is released by a tag, so the tag is the thing that has to be
+  # trustworthy: the gate runs again here, against the exact commit the tag
+  # names, rather than trusting a CI run from before the tag existed.
+  verify:
+    name: verify the tagged commit
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Read the tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "version=$version"  >> "$GITHUB_OUTPUT"
+
+          # A tag with a hyphen is a pre-release: v0.2.0-rc.1.
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: The tag must be on main
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+
+          if ! git merge-base --is-ancestor "$tag" origin/main; then
+            echo "::error::$tag is not reachable from main; releases are cut from main"
+            exit 1
+          fi
+
+      - name: The changelog must describe this version
+        run: ./scripts/changelog.sh "${{ steps.tag.outputs.version }}"
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l -s .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+      - name: Tests under the race detector
+        run: go test -race -count=1 ./...
+
+      - name: Fuzz smoke
+        run: |
+          go test -run '^$' -fuzz FuzzReloadDocument -fuzztime 60s .
+          go test -run '^$' -fuzz FuzzSubscriberOperations -fuzztime 60s .
+
+      - name: Allocation assertions
+        run: go test -count=1 -run TestCurrentDoesNotAllocate ./benchmarks/
+
+      - name: Examples build
+        run: go build -o /dev/null ./examples/...
+
+      - name: Vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  publish:
+    name: publish the release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Release notes
+        id: notes
+        run: |
+          {
+            echo 'body<<RELEASE_NOTES_EOF'
+            ./scripts/changelog.sh "${{ needs.verify.outputs.version }}"
+            echo
+            echo '---'
+            echo
+            echo '```'
+            echo 'go get github.com/ctolon/dynamic-config-go@${{ github.event.inputs.tag || github.ref_name }}'
+            echo '```'
+            echo
+            echo "[Documentation](https://pkg.go.dev/github.com/ctolon/dynamic-config-go@${{ github.event.inputs.tag || github.ref_name }}) · [Changelog](https://github.com/ctolon/dynamic-config-go/blob/main/CHANGELOG.md)"
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+          make_latest: ${{ needs.verify.outputs.prerelease == 'false' }}
+
+  index:
+    name: ask the module proxy to index the version
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Nothing is uploaded anywhere: a Go module is published by being
+      # fetchable. Asking the proxy for it is what makes pkg.go.dev show
+      # the version rather than waiting for someone else to ask first.
+      - name: Warm proxy.golang.org
+        env:
+          GOPROXY: https://proxy.golang.org
+          GONOSUMDB: ''
+          GOFLAGS: -mod=mod
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+
+          for attempt in 1 2 3 4 5; do
+            if go list -m "github.com/ctolon/dynamic-config-go@$tag"; then
+              exit 0
+            fi
+
+            echo "attempt $attempt: not indexed yet, waiting"
+            sleep 30
+          done
+
+          echo "::warning::the proxy has not indexed $tag yet; it usually catches up within a few minutes"

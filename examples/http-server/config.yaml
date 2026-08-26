@@ -1,0 +1,4 @@
+greeting: hello from the configuration file
+timeout: 5s
+features:
+  beta: false

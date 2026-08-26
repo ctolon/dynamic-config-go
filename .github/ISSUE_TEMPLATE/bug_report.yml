@@ -1,0 +1,68 @@
+name: Bug report
+description: Something behaves differently from what the documentation promises
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues do not go here — please use
+        [the advisory form](https://github.com/ctolon/dynamic-config-go/security/advisories/new).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        The smallest program that shows it. A test using `t.TempDir()` is
+        ideal. Please redact configuration values rather than pasting
+        credentials.
+      render: go
+    validations:
+      required: true
+
+  - type: dropdown
+    id: writes
+    attributes:
+      label: How is the configuration file written?
+      description: >
+        For anything involving reload, this is usually the answer. A
+        `subPath` volume mount, in particular, never updates.
+      options:
+        - Direct write (editor, os.WriteFile)
+        - Atomic replace (write a temporary file, then rename)
+        - Kubernetes ConfigMap or Secret volume
+        - Kubernetes with subPath
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Go version and OS
+      placeholder: go1.24.0, linux/amd64
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Status output
+      description: "`fmt.Printf(\"%+v\\n\", cfg.Status())` — it carries no configuration values."
+      render: text

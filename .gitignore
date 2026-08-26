@@ -1,0 +1,16 @@
+# Build and test output
+/dist/
+*.test
+*.out
+*.prof
+
+# testdata/fuzz/ is deliberately NOT ignored. The generated corpus lives in
+# the build cache; what lands under testdata/ is a minimised reproducer for
+# an input that actually failed, and committing it turns that failure into a
+# regression test the ordinary `go test` run replays for ever.
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest something the library should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The scope here is deliberately narrow: Viper owns configuration,
+        this package owns safe publication. Remote stores, secret
+        management, a plugin system, a configuration server, a metrics
+        endpoint and a templating engine have all been considered and
+        declined — see
+        [What is deliberately absent](https://github.com/ctolon/dynamic-config-go/blob/main/docs/design.md).
+
+        That is not a "no" to your idea. It is the argument it has to answer.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what makes it awkward today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The API you have in mind, if you have one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        `WithViperSetup`, a validator, a subscriber, or code in your own
+        application — and why it was not enough.

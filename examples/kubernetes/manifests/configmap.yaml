@@ -1,0 +1,18 @@
+# The configuration itself. Editing this ConfigMap is the whole update
+# workflow: no rollout, no restart, no new pod.
+#
+#   kubectl edit configmap example-config
+#
+# The kubelet republishes the projected volume within its sync period
+# (a minute or so by default), the watcher sees the ..data symlink swap,
+# and the process publishes a new snapshot.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: example-config
+data:
+  config.yaml: |
+    message: hello from the ConfigMap
+    log_level: info
+    features:
+      beta: false

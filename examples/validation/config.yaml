@@ -1,0 +1,7 @@
+server:
+  host: 127.0.0.1
+  port: 8080
+database:
+  url: postgres://localhost:5432/app
+  max_open: 32
+  max_idle: 8

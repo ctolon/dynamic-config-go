@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: example
+  template:
+    metadata:
+      labels:
+        app: example
+    spec:
+      containers:
+        - name: example
+          image: example/dynamic-config-go-example:latest
+          env:
+            - name: CONFIG_PATH
+              value: /etc/example/config.yaml
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            # Mount the whole directory, not a single file with subPath.
+            # A subPath mount is copied once at container start and is
+            # never updated, so the file would never change and there
+            # would be nothing to watch. This is the single most common
+            # reason hot reload appears not to work in Kubernetes.
+            - name: config
+              mountPath: /etc/example
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              # Readiness stays true when a reload is rejected: the pod is
+              # still serving the last good configuration.
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: config
+          configMap:
+            name: example-config
