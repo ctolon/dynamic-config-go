@@ -48,5 +48,5 @@ func main() {
 	fmt.Printf("listening on %s:%d\n", current.Server.Host, current.Server.Port)
 
 	// Viper is still right there for anything it already does well.
-	fmt.Printf("viper read %s\n", cfg.Viper.ConfigFileUsed())
+	fmt.Printf("viper read %s\n", cfg.Viper().ConfigFileUsed())
 }

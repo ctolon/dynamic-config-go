@@ -51,7 +51,7 @@ port := cfg.Current().Server.Port
 
 Everything already configured on that Viper instance keeps working:
 defaults, environment binding, aliases, search paths, formats. `Wrap` adopts
-the instance rather than replacing it, and `cfg.Viper` is the same pointer
+the instance rather than replacing it, and `cfg.Viper()` returns the same pointer
 that was passed in.
 
 ## Step by step
@@ -59,7 +59,7 @@ that was passed in.
 ### 1. Wrap the instance
 
 Keep the Viper setup exactly as it is; add `Wrap`. Nothing else has to
-change yet — `cfg.Viper.GetInt("server.port")` still works, so existing call
+change yet — `cfg.Viper().GetInt("server.port")` still works, so existing call
 sites keep compiling.
 
 ### 2. Add a validator
@@ -143,23 +143,29 @@ bursts, and understands Kubernetes projected volumes.
 
 ## Things to keep in mind
 
-**`cfg.Viper.Set` does not publish.** It changes Viper's state. A reload
+**`cfg.Viper().Set` does not publish.** It changes Viper's state. A reload
 publishes:
 
 ```go
-cfg.Viper.Set("feature.enabled", true)
+cfg.Viper().Set("feature.enabled", true)
 
 if err := cfg.Reload(ctx); err != nil {
     return err
 }
 ```
 
-**Do not read `cfg.Viper` from other goroutines once reloads can run.** Viper
-does no locking, and a reload writes its state.
+**Do not read `cfg.Viper()` from other goroutines once reloads can run.**
+Viper does no locking, and a reload writes its state. When the migration is
+finished and nothing needs raw key access any more, `WrapSealed` closes that
+route for good.
 
 **Snapshots are immutable by contract.** Do not write through the pointer
 `Current()` returns, or through the maps and slices inside it.
 
 **Keep using Viper for what Viper does.** Defaults, environment variables,
-aliases, formats and search paths are still Viper's, through `cfg.Viper` or
-`WithViperSetup`.
+aliases, formats and search paths are still Viper's, through `cfg.Viper()`
+or `WithViperSetup`.
+
+**Environment changes do not reload themselves.** Only files produce events.
+A variable that changes inside the running process is picked up by the next
+`Reload(ctx)`, and nothing schedules that call for you.

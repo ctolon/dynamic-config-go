@@ -58,30 +58,63 @@ decision, and each of them is what this package standardises.
 | | subscriptions and callback safety |
 | | lifecycle and status |
 
-## Why Viper is public
+## Why Viper is reachable — and why it can also be sealed
+
+Viper is part of the contract, not an implementation detail. Hiding it
+entirely and re-exporting the parts people need would produce a second
+configuration DSL, then a stream of requests to widen it, and eventually a
+wrapper around `RegisterAlias` that is subtly not `RegisterAlias`.
+
+But leaving it reachable has a cost that is just as real. Viper has no
+internal locking, so a runtime read racing a reload is a data race; and
+`cfg.Viper().GetString` is an API that spreads, quietly turning a typed
+configuration back into a stringly-typed one.
+
+Both are true, so both shapes exist:
+
+|                  | engine reachable | engine sealed |
+| ---------------- | ---------------- | ------------- |
+| **built for you** | `New`            | `NewSealed`   |
+| **your instance** | `Wrap`           | `WrapSealed`  |
+
+Sealing is not a lesser mode. It is the same machinery with one route
+removed: `Viper()` returns nil, so nothing downstream of the `Config` can
+read, mutate or replace the engine. The engine is still fully configurable
+during construction, through the options and `WithViperSetup`, which is the
+only moment at which configuring it is safe anyway.
+
+`WrapSealed` is the one that pays off at a package boundary:
 
 ```go
-type Config[T any] struct {
-    Viper *viper.Viper
-    // ...
+func Load() (*dynamicconfig.Config[AppConfig], error) {
+    v := viper.New()
+    v.SetConfigFile("/etc/myapp/config.yaml")
+    v.SetEnvPrefix("MYAPP")
+    v.AutomaticEnv()
+
+    return dynamicconfig.WrapSealed[AppConfig](v, dynamicconfig.WithValidator(validate))
 }
 ```
 
-Viper is part of the contract, not an implementation detail. The
-alternative — hiding it and re-exporting the parts people need — produces a
-second configuration DSL, and then a stream of requests to widen it, and
-then a wrapper around `RegisterAlias` that is subtly not `RegisterAlias`.
+The local `v` goes out of scope and every caller gets a configuration with
+one public interface and no way behind it.
 
-It is a field rather than an embedded type deliberately. Embedding would put
-`cfg.Get`, `cfg.Set` and `cfg.Unmarshal` next to `cfg.Current`, invite
-method-name collisions, and blur exactly the distinction the package exists
-to draw. `cfg.Viper.GetString(...)` reads as what it is: a question for
-Viper, not for the application's configuration.
+### Why `Viper()` is a method
+
+It started as a public field, which read slightly better at a call site and
+was wrong in two ways. A field can be *assigned* — anything holding the
+`Config` could swap the engine underneath a running reload — and a sealed
+`Config` would have had to express "no engine here" as a nil field, which is
+a footgun rather than an answer.
+
+A method can refuse. It is also the reason `Sealed()` exists: an explicit
+question deserves an explicit answer rather than a nil check somebody has to
+know to make.
 
 ## Why the API is this small
 
-The public surface is nine methods, two constructors and eight options. Not
-because more would be hard to write, but because every addition is a
+The public surface is eleven methods, four constructors and nine options.
+Not because more would be hard to write, but because every addition is a
 promise, and a configuration library's promises are load-bearing for
 everything above it.
 
@@ -148,6 +181,20 @@ manufacture a generation.)
 validate again in a second. Retrying it produces a log full of the same
 error and nothing else. The next filesystem event is the retry.
 
+**A polling fallback.** Network filesystems often deliver no events, and the
+obvious answer — stat the file every few seconds — turns a library that is
+idle between changes into one that is never idle. It would also be the
+wrong default for the overwhelming majority of deployments, which are on a
+local filesystem. Applications on NFS or SMB should reload from a signal or
+a timer of their own, which is three lines and stays visible; see
+[compatibility.md](compatibility.md#not-guaranteed).
+
+**`WaitForGeneration`.** A method that blocks until a generation appears
+would be convenient in tests and in control planes, and it would add a
+condition variable, a wakeup path and a set of cancellation questions to a
+library whose value is that it has none of those. Polling `Generation()` is
+two lines in the test that needs it.
+
 **A validation framework.** `func(*T) error` is the whole contract, so
 go-playground/validator, ozzo-validation, generated code and a handful of
 `if` statements are equally first-class, and the dependency graph gains
@@ -158,8 +205,9 @@ application exports it through whatever it already uses.
 
 ## Dependencies
 
-Direct: Viper, and fsnotify, which Viper already depends on. Nothing for
-errors, logging, worker pools, retries, validation, metrics, lifecycle or
+Direct: Viper, and fsnotify — which Viper already depends on, so neither is
+a module an adopting application did not already have. Nothing for errors,
+logging, worker pools, retries, validation, metrics, lifecycle or
 debouncing — the standard library covers all of them, and each avoided
 dependency is one an adopting application does not have to audit.
 
@@ -168,16 +216,10 @@ library.
 
 ## Compatibility policy
 
-Before 1.0 the API may still move. From 1.0 the following are stable
-contracts, and breaking any of them requires a major version:
+Lives in [compatibility.md](compatibility.md): the signatures frozen at 1.0,
+the behavioural questions answered for good, the supported Go and Viper
+versions, and the filesystem matrix.
 
-- `Config[T]`, `New`, `Wrap`, `Current`, `Reload`, `Watch`, `Close`;
-- validation semantics: read, decode, validate, publish, in that order;
-- last-known-good: a rejected candidate never disturbs the published
-  snapshot;
-- subscription semantics, including bounded best-effort delivery;
-- error wrapping: every returned error wraps its cause, and the sentinels
-  answer `errors.Is`.
-
-Adding a field to `Status` or an option to the constructor is a minor
-release. Changing what `Current()` may return is not a thing that happens.
+The short version: adding a field to `Status`, an option, or a constructor
+is a minor release. Changing what `Current()` may return is not a thing that
+happens.

@@ -36,9 +36,10 @@ it is a good idea:
 - Dependencies need justification. There are two, both unavoidable.
 
 Remote stores, secret management, a plugin system, a configuration server, a
-metrics endpoint, a templating engine and an expression language have all
-been considered and declined. See "What is deliberately absent" in
-[docs/design.md](docs/design.md).
+metrics endpoint, a templating engine, an expression language, a polling
+fallback and a `WaitForGeneration` helper have all been considered and
+declined, each for a reason worth reading before re-proposing it. See "What
+is deliberately absent" in [docs/design.md](docs/design.md).
 
 If you are unsure whether a change fits, open an issue before writing it.
 
@@ -50,10 +51,13 @@ A change to any of these needs a test that would fail without it:
 - last-known-good behaviour;
 - anything touching concurrency, publication or the lifecycle;
 - watcher behaviour on any filesystem event;
-- anything that could put a configuration value into a log or an error.
+- anything that could put a configuration value into a log or an error;
+- any exported signature — `api_test.go` has to be updated deliberately.
 
 The invariants in [docs/concurrency.md](docs/concurrency.md) are the list to
-check a change against.
+check a change against, and the compatibility policy in
+[docs/compatibility.md](docs/compatibility.md) is what a change to the
+public surface has to answer to.
 
 ## Style
 
@@ -76,16 +80,28 @@ Five layers, all run in CI:
 
 | Layer | Where | What it covers |
 | --- | --- | --- |
-| unit | `*_test.go` | construction, options, reload, subscriptions, lifecycle |
+| unit | `config_test.go`, `lifecycle_test.go` | construction, options, reload, subscriptions, close/publish ordering |
+| white-box | `internal_test.go` | handler retention, which is not observable from outside |
+| surface | `api_test.go` | the exported signatures the compatibility policy freezes |
 | integration | `integration/` | real files: writes, renames, deletion, permissions, projected volumes |
-| concurrency | `integration/` | readers racing reloads, under `-race` |
-| fuzz | `fuzz_test.go` | arbitrary documents, random subscription sequences |
+| concurrency | `integration/`, `lifecycle_test.go` | readers racing reloads, close racing publication, under `-race` |
+| fuzz | `fuzz_test.go` | arbitrary documents, and random operation orderings checked against every invariant |
 | benchmark | `benchmarks/` | `Current()` cost and its zero-allocation promise |
 
 Prefer a deterministic test to a timing-dependent one: `WithDebounce(0)` and
 an explicit `Reload` exercise the same transaction the watcher does. When a
 test must wait for the filesystem, poll for the condition rather than
 sleeping for a guess.
+
+For orderings, force them. A validator that blocks on a channel stops a
+reload at a known point — past read and decode, holding a candidate it has
+not published — so a competing `Close` can be run to completion and the
+winner asserted rather than hoped for. `lifecycle_test.go` has the pattern.
+
+An assertion that depends on how fast the machine is will eventually fail on
+somebody else's machine. Derive the bound from something measured (how long
+a burst actually took) rather than assuming (that twenty-five writes fit in
+one debounce window).
 
 ## Commits and pull requests
 

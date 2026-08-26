@@ -2,6 +2,7 @@ package dynamicconfig_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,14 +82,20 @@ func FuzzReloadDocument(f *testing.F) {
 	})
 }
 
-// FuzzSubscriberOperations drives random sequences of subscription,
-// unsubscription and reload. It is looking for panics and deadlocks in the
-// registry and the dispatcher, which are the parts where lifetimes overlap
-// most.
-func FuzzSubscriberOperations(f *testing.F) {
-	f.Add([]byte{0, 1, 2, 3, 4, 5})
+// FuzzLifecycleModel drives random sequences of the operations an
+// application can perform and checks the package's invariants after every
+// one of them.
+//
+// Fuzzing a parser looks for inputs that crash it. This looks for
+// *orderings* that break a promise — a snapshot that vanishes, a generation
+// that moves after close, a Reload that succeeds on a closed
+// configuration — which is where a concurrent lifecycle actually goes
+// wrong.
+func FuzzLifecycleModel(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7})
 	f.Add([]byte{1, 1, 1, 1})
 	f.Add([]byte{4, 0, 4, 2, 3})
+	f.Add([]byte{5, 4, 0, 6, 7})
 	f.Add([]byte{2, 2, 2, 2, 2, 2, 2, 2})
 
 	f.Fuzz(func(t *testing.T, ops []byte) {
@@ -111,10 +118,21 @@ func FuzzSubscriberOperations(f *testing.F) {
 
 		defer func() { _ = cfg.Close() }()
 
-		var subs []dynamicconfig.Subscription
+		// The model: what the invariants are checked against.
+		var (
+			subs            []dynamicconfig.Subscription
+			highest         = cfg.Generation()
+			closed          bool
+			frozenSnapshot  *appConfig
+			frozenGeneraton uint64
+		)
+
+		if highest != 1 {
+			t.Fatalf("construction published generation %d, want 1", highest)
+		}
 
 		for _, op := range ops {
-			switch op % 6 {
+			switch op % 8 {
 			case 0:
 				subs = append(subs, cfg.Subscribe(func(dynamicconfig.Change[appConfig]) {}))
 
@@ -129,23 +147,81 @@ func FuzzSubscriberOperations(f *testing.F) {
 
 			case 3:
 				for _, sub := range subs {
-					// Unsubscribing twice is documented as safe.
+					// Documented as idempotent, so twice must be as
+					// safe as once.
 					sub.Unsubscribe()
 					sub.Unsubscribe()
 				}
 
 			case 4:
-				_ = cfg.Reload(context.Background())
+				err := cfg.Reload(context.Background())
+
+				if closed && !errors.Is(err, dynamicconfig.ErrClosed) {
+					t.Fatalf("Reload on a closed config = %v, want ErrClosed", err)
+				}
 
 			case 5:
-				_ = cfg.Close()
+				// A write that may or may not be valid, so that reloads
+				// have something to accept and something to reject.
+				writeConfigT(t, path, "server:\n  host: fuzzed\n  port: 9000\n")
+
+			case 6:
+				writeConfigT(t, path, "server:\n  port: 70000\n")
+
+			case 7:
+				if err := cfg.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+
+				if !closed {
+					closed = true
+					frozenSnapshot = cfg.Current()
+					frozenGeneraton = cfg.Generation()
+				}
 			}
 
-			if cfg.Current() == nil {
+			// Invariants, after every operation.
+			current := cfg.Current()
+
+			if current == nil {
 				t.Fatal("the published snapshot was cleared")
 			}
 
-			_ = cfg.Status()
+			generation := cfg.Generation()
+
+			if generation < highest {
+				t.Fatalf("generation went backwards: %d after %d", generation, highest)
+			}
+
+			highest = generation
+
+			status := cfg.Status()
+
+			if status.Generation != status.SuccessfulReloads+1 {
+				t.Fatalf("generation %d does not match %d successful reloads plus the initial load",
+					status.Generation, status.SuccessfulReloads)
+			}
+
+			if !closed {
+				continue
+			}
+
+			// Close is terminal: nothing published, nothing moved.
+			if current != frozenSnapshot {
+				t.Fatal("the snapshot changed after close")
+			}
+
+			if generation != frozenGeneraton {
+				t.Fatalf("generation moved from %d to %d after close", frozenGeneraton, generation)
+			}
+
+			if !status.Closed {
+				t.Fatal("status does not report a closed config as closed")
+			}
+
+			if err := cfg.Watch(context.Background()); !errors.Is(err, dynamicconfig.ErrClosed) {
+				t.Fatalf("Watch on a closed config = %v, want ErrClosed", err)
+			}
 		}
 	})
 }

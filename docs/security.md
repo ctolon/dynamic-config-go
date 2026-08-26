@@ -49,9 +49,13 @@ No panic, no exit, no silent demotion to defaults.
 **The parsing boundary is fuzzed.** `FuzzReloadDocument` feeds arbitrary
 documents through read, decode and validate, asserting that no input panics
 and that no rejected input can disturb the published snapshot.
-`FuzzSubscriberOperations` drives random sequences of subscribe,
-unsubscribe, reload and close, looking for panics and deadlocks. Both run in
-CI.
+`FuzzLifecycleModel` drives random sequences of subscribe, unsubscribe,
+reload, write and close, checking every invariant after every operation.
+Both run on each push and for ten minutes each on a weekly schedule.
+
+**Extension code cannot take the process down.** A panicking subscriber
+costs its own callback; a panicking validator costs its candidate. Both are
+recovered, reported and survived.
 
 **Errors keep their chains.** Everything wraps with `%w`, so `errors.Is` and
 `errors.As` work all the way down, and no error is reconstructed from a
@@ -77,14 +81,46 @@ management belongs to Vault, a cloud provider's secret store, or the
 Kubernetes Secret machinery.
 
 **It does not make Viper concurrency-safe.** Viper has no internal locking.
-Reading `cfg.Viper` from another goroutine while a reload writes it is a
+Reading `cfg.Viper()` from another goroutine while a reload writes it is a
 data race this package cannot prevent — only decline to pretend otherwise.
-See [concurrency.md](concurrency.md).
+Sealing the configuration (`NewSealed`, `WrapSealed`) removes the route
+rather than the race. See [concurrency.md](concurrency.md).
 
-**It does not validate the file's provenance.** Whoever can write the
-configuration file can change the process's configuration, within whatever
-the validator permits. File permissions and mount configuration are the
-control here; the validator is a second, useful one.
+**It does not sanitise validator errors.** A validator is application code,
+and its error is logged when a logger is configured. This library cannot
+stop it saying:
+
+```go
+return fmt.Errorf("invalid password %q", c.Database.Password)   // don't
+```
+
+Name the field, not the value:
+
+```go
+return fmt.Errorf("database.password is shorter than 12 characters")
+```
+
+The same applies to any error an application builds from a snapshot.
+
+**It does not validate the file's provenance, or police its permissions.**
+Whoever can write the configuration file can change the process's
+configuration, within whatever the validator permits. The library reads
+what it is pointed at and does not check the mode — a library that started
+refusing files based on their permission bits would be wrong in someone's
+deployment on its first day.
+
+Deployment rules worth applying anyway:
+
+- readable by the service user, writable by nobody else;
+- the *directory* trusted too, because the watcher watches the directory and
+  a file can be replaced by replacing what its name points at;
+- a configuration path under a location a local user controls is a
+  configuration that local user controls.
+
+**It is not a filesystem sandbox.** If the configuration path is writable by
+an untrusted local user, symlink replacement is already an application
+security problem, and one this library is in no position to solve. The path
+and its directory must be trusted.
 
 **It does not fingerprint configurations.** Hashing a generic `T` means
 serialising it, and serialising it means walking fields that may be secrets.
@@ -92,18 +128,26 @@ Deliberately absent.
 
 ## Threat model in one line
 
-An attacker who can write the configuration file can reconfigure the process
-within the validator's limits. An attacker who cannot write it can, at
-worst, cause reload failures — and those leave the running configuration
-untouched.
+An attacker who can write the configuration file, or the directory holding
+it, can reconfigure the process within the validator's limits. An attacker
+who cannot write either can, at worst, cause reload failures — and those
+leave the running configuration untouched.
+
+The validator is therefore a security control as well as a correctness one:
+it is the last thing between a file and a running process.
 
 ## Supply chain
 
-- Two direct dependencies: Viper, and fsnotify, which Viper already brings.
-  Nothing added for errors, logging, retries, worker pools, validation or
-  metrics.
-- CI runs `govulncheck ./...` on every push, and on a schedule.
-- CI runs `go vet` and `staticcheck`.
+- Two dependencies, Viper and fsnotify — and Viper depends on fsnotify, so
+  neither is a module a Viper application did not already have. Nothing
+  added for errors, logging, retries, worker pools, validation or metrics.
+- CI runs `govulncheck` on every push, and on a schedule.
+- CI runs `go vet` and `staticcheck`, both pinned to explicit versions — a
+  floating analysis tool can turn `main` red without a change to this
+  repository, and a build that is not reproducible cannot tell you whether
+  your own change broke something.
+- Third-party GitHub Actions are pinned by commit SHA, with the tag kept in
+  a trailing comment so a reader can still see what it is.
 - Every test runs under the race detector.
 - Dependency updates arrive through automated pull requests and are
   reviewed.

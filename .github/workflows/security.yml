@@ -25,7 +25,27 @@ jobs:
           go-version: stable
 
       - name: Scan for known vulnerabilities
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: make vuln
+
+  soak:
+    name: soak
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Readers, writers, subscribers and reloads all at once, for long
+      # enough that what only appears with time has a chance to: a counter
+      # that drifts, a goroutine that accumulates, memory that grows with
+      # the number of events rather than with the size of the
+      # configuration.
+      - name: Soak for fifteen minutes
+        run: go test -race -count=1 -run TestSoak -soak 15m -v ./integration/
 
   deep-fuzz:
     name: extended fuzzing
@@ -41,8 +61,8 @@ jobs:
       - name: Fuzz the reload boundary
         run: go test -run '^$' -fuzz FuzzReloadDocument -fuzztime 10m .
 
-      - name: Fuzz subscriber operations
-        run: go test -run '^$' -fuzz FuzzSubscriberOperations -fuzztime 10m .
+      - name: Fuzz the lifecycle model
+        run: go test -run '^$' -fuzz FuzzLifecycleModel -fuzztime 10m .
 
       - name: Upload failing corpus
         if: failure()
@@ -54,7 +74,7 @@ jobs:
   security-green:
     name: Security is green
     runs-on: ubuntu-latest
-    needs: [govulncheck]
+    needs: [govulncheck, soak]
     if: always()
     steps:
       - name: Every job succeeded

@@ -23,6 +23,15 @@ type Subscription interface {
 type registry[H any] struct {
 	mu sync.Mutex
 
+	// closed makes the registry terminal. It exists so that "a closed
+	// configuration retains no handler" is a property of the registry
+	// rather than of every caller remembering to check first: a
+	// check-then-add against the lifecycle would let a subscription
+	// arriving alongside Close survive it, keeping whatever the handler
+	// closed over — a database pool, a cache, a whole service — reachable
+	// for as long as anything holds the Config.
+	closed bool
+
 	nextID uint64
 
 	entries []entry[H]
@@ -33,9 +42,15 @@ type entry[H any] struct {
 	handler H
 }
 
-func (r *registry[H]) add(handler H) uint64 {
+// add registers a handler. It reports false, and retains nothing, once the
+// registry is closed.
+func (r *registry[H]) add(handler H) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.closed {
+		return 0, false
+	}
 
 	r.nextID++
 
@@ -43,7 +58,7 @@ func (r *registry[H]) add(handler H) uint64 {
 
 	r.entries = append(r.entries, entry[H]{id: id, handler: handler})
 
-	return id
+	return id, true
 }
 
 func (r *registry[H]) remove(id uint64) {
@@ -88,13 +103,14 @@ func (r *registry[H]) snapshot() []H {
 	return out
 }
 
-// clear drops every handler. Close uses it so that a Config held alive by
-// an application reference does not keep its subscribers' closures — and
-// whatever they capture — reachable.
-func (r *registry[H]) clear() {
+// close drops every handler and refuses further registration, so that a
+// Config an application still holds does not keep its subscribers' closures
+// — and whatever they captured — reachable.
+func (r *registry[H]) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.closed = true
 	r.entries = nil
 }
 

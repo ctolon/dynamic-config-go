@@ -37,9 +37,16 @@ signal, in counter form.
 **Is it a Kubernetes `subPath` mount?** A `subPath` mount never updates. See
 [kubernetes.md](kubernetes.md).
 
-**Is the application reading `cfg.Viper` instead of `cfg.Current()`?**
-`cfg.Viper.GetInt(...)` reads Viper's state, which is a different thing from
-the published snapshot.
+**Is the application reading the engine instead of the snapshot?**
+`cfg.Viper().GetInt(...)` reads Viper's state, which is a different thing
+from the published snapshot — and is a data race next to a reload. Sealing
+the configuration (`NewSealed`, `WrapSealed`) makes this mistake
+impossible.
+
+**Did anything actually change on disk?** Only files produce events. A
+variable in the process environment, a `cfg.Viper().Set(...)`, or a default
+registered after construction all wait for the next `Reload(ctx)`, and
+nothing schedules that call for you.
 
 **Is the value cached somewhere?** A snapshot read once at startup and
 stored in a struct field will never change. Read `Current()` per unit of
@@ -49,7 +56,32 @@ work.
 directory containing the configured path. A symlink pointing somewhere else
 entirely means changes happen in a directory nobody is watching. Point the
 configuration at the real path, or at a Kubernetes-style `..data` layout,
-which is handled.
+which is handled. On macOS, kqueue follows a watched symlink to its target,
+so replacing the link itself produces no event at all.
+
+**Is the file on a network filesystem?** NFS, SMB and FUSE often deliver no
+events: the local kernel does not see a write made by another host. This is
+not slowness, it is silence, and no library can invent the event. Reload
+from a signal or a timer instead — see
+[compatibility.md](compatibility.md#not-guaranteed).
+
+## A file being rewritten constantly never reloads
+
+The debounce window is a *quiet* window: each event restarts it. A file
+rewritten faster than the window — a templating sidecar in a tight loop, a
+test writing every millisecond — therefore never goes quiet, and the reload
+never fires until the writes pause.
+
+This is the intended behaviour, and it is worth knowing rather than
+debugging. If the writer is pathological, fix the writer; if the workload
+genuinely produces continuous changes, lower or disable the window:
+
+```go
+dynamicconfig.WithDebounce[AppConfig](0)   // reload per event, still coalesced
+```
+
+Zero does not mean unbounded work: a reload still runs alone, and events
+that arrive while one is running still collapse into at most one more.
 
 ## It reloads several times for one save
 
@@ -134,6 +166,24 @@ cfg.Subscribe(func(change dynamicconfig.Change[AppConfig]) {
 
 Raising `WithEventBuffer` buys headroom but does not make delivery reliable.
 Anything that needs authoritative state should read `Current()`.
+
+## Viper() returns nil
+
+The configuration is sealed — built with `NewSealed` or `WrapSealed` — so
+the engine is deliberately unreachable through it. Configure the engine at
+construction, with the options or `WithViperSetup`, and read the
+application's configuration through `Current()`. `cfg.Sealed()` is the
+explicit form of the check.
+
+If a subsystem genuinely needs raw key access, build the configuration with
+`New` or `Wrap` instead, and treat `cfg.Viper()` as construction-time state.
+
+## Reload returns ErrClosed
+
+The configuration was closed, or a `Close` won the race to the commit while
+this reload was still reading, decoding or validating. The candidate was not
+published, nothing was disturbed, and it is not counted as a failed reload:
+a shutdown is not a verdict on the configuration.
 
 ## Close() returns an error
 

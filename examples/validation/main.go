@@ -93,9 +93,9 @@ func main() {
 
 	// Now the part worth watching. Setting a value on Viper changes what
 	// Viper reports immediately...
-	cfg.Viper.Set("server.port", -1)
+	cfg.Viper().Set("server.port", -1)
 
-	fmt.Printf("viper now reports port %d\n", cfg.Viper.GetInt("server.port"))
+	fmt.Printf("viper now reports port %d\n", cfg.Viper().GetInt("server.port"))
 	fmt.Printf("the snapshot still reports port %d\n", cfg.Current().Server.Port)
 
 	// ...but publishing it takes a reload, and the validator refuses.

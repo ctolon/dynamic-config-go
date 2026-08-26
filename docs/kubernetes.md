@@ -102,6 +102,40 @@ An **immutable** ConfigMap (`immutable: true`) is never updated in place, so
 there is nothing to reload. Changing it means creating a new ConfigMap and
 updating the pod spec, which restarts the pod.
 
+## A ConfigMap and a Secret together
+
+The usual production shape is two volumes: a ConfigMap with the
+configuration, and a Secret with the credentials it deliberately leaves out.
+They are layers of one configuration, so they belong in one instance:
+
+```yaml
+volumeMounts:
+  - name: config
+    mountPath: /etc/myapp
+    readOnly: true
+  - name: secrets
+    mountPath: /etc/myapp/secrets
+    readOnly: true
+```
+
+```go
+cfg, err := dynamicconfig.NewSealed[AppConfig](
+    dynamicconfig.WithConfigFile[AppConfig]("/etc/myapp/config.yaml"),
+    dynamicconfig.WithConfigFile[AppConfig]("/etc/myapp/secrets/secret.yaml"),
+    dynamicconfig.WithValidator(validate),
+)
+```
+
+Both are projected volumes, both are watched — each in its own directory —
+and either one being republished reloads the whole configuration. The
+validator sees the merged result, so `database.dsn is empty` is a rule that
+can exist even though the DSN and the pool settings arrive from different
+volumes.
+
+Rotating the Secret publishes a new snapshot without restarting the pod.
+Deleting it does not fall back to the ConfigMap: the reload is rejected and
+the last good configuration keeps serving.
+
 ## Secrets
 
 Secret volumes use the same projected-volume mechanism and behave the same

@@ -1,6 +1,7 @@
 package dynamicconfig
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -12,11 +13,18 @@ import (
 // Config publishes a validated, typed snapshot of T and replaces it
 // atomically when the configuration on disk changes.
 //
-// The two halves of the type answer different questions, and the difference
-// is the single most important thing to understand about the package:
+// A Config is built in one of two shapes. An open one keeps the Viper
+// instance reachable through Viper, so that an application can go on using
+// everything Viper does well; a sealed one does not, so that the engine
+// cannot be reached, mutated or raced from anywhere the Config travels to.
+// See New and NewSealed.
 //
-//	cfg.Viper.GetInt("server.port")  // Viper's current, mutable state
-//	cfg.Current().Server.Port        // the last snapshot that decoded and validated
+// In an open Config the two halves answer different questions, and the
+// difference is the single most important thing to understand about the
+// package:
+//
+//	cfg.Viper().GetInt("server.port")  // Viper's current, mutable state
+//	cfg.Current().Server.Port          // the last snapshot that decoded and validated
 //
 // They can disagree, and when they do, Current is the one the application
 // should believe. Setting a bad value on Viper changes what Viper reports
@@ -30,36 +38,24 @@ import (
 // The zero value is not usable. Construct one with New or Wrap, and Close
 // it when the application is done with it.
 type Config[T any] struct {
-	// Viper is the configuration engine, exposed on purpose rather than
-	// hidden behind a second configuration API. Defaults, environment
-	// binding, aliases, search paths and formats are Viper's job and stay
-	// Viper's job.
-	//
-	// It is a field rather than an embedded type so that cfg.Current and
-	// cfg.Viper.Get never collide, and so that the boundary between "what
-	// Viper knows" and "what the application runs on" stays visible at
-	// every call site.
-	//
-	// Reading or mutating it concurrently with a reload is not safe:
-	// Viper does no internal locking, and a reload writes Viper's state.
-	// Configure it before the first reload — or from a Viper setup
-	// function — and read the application's configuration through
-	// Current.
-	Viper *viper.Viper
+	// viper is the configuration engine. Whether it is reachable from
+	// outside depends on how the Config was built; see Viper.
+	viper *viper.Viper
 
 	// current is the published snapshot. Readers load it without a lock,
 	// which is why reads cost an atomic load and no allocation.
 	current atomic.Pointer[T]
 
-	// configFile caches what Viper last read, so that Status and Watch
-	// need not read Viper's fields while a reload writes them.
-	configFile atomic.Pointer[string]
+	// configFiles caches the files the published snapshot was read from,
+	// in the order they were layered, so that Status and Watch need not
+	// read Viper's fields while a reload writes them.
+	configFiles atomic.Pointer[[]string]
 
-	// fileStamp is the size, mode and modification time of the file at the
-	// last successful read. Watch compares it against the file on disk to
-	// close the gap between loading and watching without republishing a
-	// configuration that never changed.
-	fileStamp atomic.Pointer[fileStamp]
+	// fileStamps holds the size, mode and modification time of each of
+	// those files at the moment it was read. Watch compares them against
+	// what is on disk to close the gap between loading and watching
+	// without republishing a configuration that never changed.
+	fileStamps atomic.Pointer[map[string]fileStamp]
 
 	// watching reports that a watch is established, rather than merely
 	// claimed. Claiming happens first, so that a second Watch can be
@@ -72,6 +68,22 @@ type Config[T any] struct {
 	// a caller's context: a Reload that cannot get in must be cancellable
 	// rather than blocked.
 	reloadSem chan struct{}
+
+	// publishMu orders two events that must not interleave: the commit of
+	// a new snapshot, and the transition to closing. Without it, a reload
+	// that checked "not closed" before doing its work could publish a
+	// generation after Close had already returned — a configuration
+	// changing under an application that had shut its configuration down.
+	//
+	// The critical section is deliberately tiny. No file is read, nothing
+	// is decoded, no validator runs and no callback fires while it is
+	// held; it guards a handful of atomic stores and a lifecycle
+	// transition, and nothing else.
+	publishMu sync.Mutex
+
+	// sealed records that the Viper instance is not reachable through
+	// this Config. See NewSealed.
+	sealed bool
 
 	generation        atomic.Uint64
 	successfulReloads atomic.Uint64
@@ -90,6 +102,36 @@ type Config[T any] struct {
 	dispatcher *dispatch.Dispatcher
 
 	opts options[T]
+}
+
+// Viper returns the underlying configuration engine, or nil if the Config
+// was sealed.
+//
+// It is a method rather than a field so that the engine cannot be replaced
+// from outside, and so that a sealed Config has an honest answer to give.
+// Callers that may receive either shape should ask:
+//
+//	if v := cfg.Viper(); v != nil {
+//	    v.SetDefault("server.port", 8080)
+//	}
+//
+// The instance it returns is Viper's ordinary API, with Viper's ordinary
+// concurrency properties — which is to say none. Viper does no internal
+// locking and a reload writes its state, so it is safe to use before
+// reloads can run and unsafe afterwards. Configure it during construction;
+// read the application's configuration through Current.
+func (c *Config[T]) Viper() *viper.Viper {
+	if c.sealed {
+		return nil
+	}
+
+	return c.viper
+}
+
+// Sealed reports whether the Viper instance is unreachable through this
+// Config. It is the explicit form of a nil check on Viper.
+func (c *Config[T]) Sealed() bool {
+	return c.sealed
 }
 
 // Current returns the configuration the application should run on.
@@ -130,6 +172,7 @@ func (c *Config[T]) Status() Status {
 		Watching:          c.watching.Load(),
 		Closed:            c.life.Closed(),
 		ConfigFile:        c.configFileUsed(),
+		ConfigFiles:       c.configFilesUsed(),
 		DroppedEvents:     c.dispatcher.Dropped(),
 	}
 }
@@ -170,7 +213,12 @@ func (c *Config[T]) Subscribe(handler ChangeHandler[T]) Subscription {
 		return newSubscription(nil)
 	}
 
-	id := c.changeSubs.add(handler)
+	id, ok := c.changeSubs.add(handler)
+	if !ok {
+		// Closed. The handler is not retained, so a subscription made
+		// during shutdown cannot keep whatever it captured alive.
+		return newSubscription(nil)
+	}
 
 	return newSubscription(func() { c.changeSubs.remove(id) })
 }
@@ -190,7 +238,10 @@ func (c *Config[T]) SubscribeErrors(handler ErrorHandler) Subscription {
 		return newSubscription(nil)
 	}
 
-	id := c.errorSubs.add(handler)
+	id, ok := c.errorSubs.add(handler)
+	if !ok {
+		return newSubscription(nil)
+	}
 
 	return newSubscription(func() { c.errorSubs.remove(id) })
 }
@@ -209,14 +260,18 @@ func (c *Config[T]) SubscribeErrors(handler ErrorHandler) Subscription {
 // still running when that patience runs out, Close returns an error saying
 // so; the Config is closed either way.
 func (c *Config[T]) Close() error {
-	if !c.life.BeginClose() {
+	if !c.beginClose() {
 		return nil
 	}
 
+	// From here no snapshot can be published: beginClose took the
+	// publication gate to make the transition, so any reload still in
+	// flight either committed before it or will find the Config closed
+	// when it reaches its own commit.
 	drained := c.dispatcher.Stop(closeTimeout)
 
-	c.changeSubs.clear()
-	c.errorSubs.clear()
+	c.changeSubs.close()
+	c.errorSubs.close()
 
 	c.life.FinishClose()
 
@@ -235,21 +290,47 @@ func (c *Config[T]) Close() error {
 	return nil
 }
 
+// beginClose performs the lifecycle transition under the publication gate,
+// so that closing and committing a snapshot cannot interleave: one of them
+// happens first, and which one it was is unambiguous afterwards.
+//
+// It reports whether this call is the one that started closing.
+func (c *Config[T]) beginClose() bool {
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	return c.life.BeginClose()
+}
+
 // closed reports whether the Config is closing or closed.
 func (c *Config[T]) closed() bool {
 	return c.life.Closed()
 }
 
+// configFileUsed returns the primary file — the first one layered — or
+// empty for a configuration that has none.
 func (c *Config[T]) configFileUsed() string {
-	if p := c.configFile.Load(); p != nil {
-		return *p
+	files := c.configFilesUsed()
+	if len(files) == 0 {
+		return ""
 	}
 
-	return ""
+	return files[0]
 }
 
-func (c *Config[T]) setConfigFileUsed(path string) {
-	c.configFile.Store(&path)
+// configFilesUsed returns a copy of the files the published snapshot was
+// read from. A copy, because Status hands it to callers and a shared slice
+// would be a shared mutable.
+func (c *Config[T]) configFilesUsed() []string {
+	stored := c.configFiles.Load()
+	if stored == nil || len(*stored) == 0 {
+		return nil
+	}
+
+	files := make([]string, len(*stored))
+	copy(files, *stored)
+
+	return files
 }
 
 func loadTime(v *atomic.Int64) time.Time {

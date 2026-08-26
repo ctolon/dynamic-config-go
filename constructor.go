@@ -8,8 +8,26 @@ import (
 	"github.com/spf13/viper"
 )
 
-// New builds a Config with its own Viper instance and performs the initial
-// load.
+// There are four constructors, along two axes: who owns the Viper instance,
+// and whether the Config lets anything reach it.
+//
+//	                 │ engine reachable      │ engine sealed
+//	─────────────────┼───────────────────────┼─────────────────────
+//	built for you    │ New                   │ NewSealed
+//	your instance    │ Wrap                  │ WrapSealed
+//
+// Reachable is the pragmatic shape: cfg.Viper() hands back the engine, and
+// everything Viper does well stays available. Sealed is the encapsulated
+// shape: cfg.Viper() is nil, the engine cannot be read, mutated or replaced
+// through the Config, and the configuration has exactly one public
+// interface — Current, Reload, Watch and the rest of this package.
+//
+// Neither is a lesser option. Which one fits depends on whether the Config
+// is going to be passed around a codebase that should not be able to reach
+// past it.
+
+// New builds a Config with its own Viper instance, reachable through Viper,
+// and performs the initial load.
 //
 //	cfg, err := dynamicconfig.New[AppConfig](
 //	    dynamicconfig.WithConfigFile[AppConfig]("/etc/myapp/config.yaml"),
@@ -35,10 +53,41 @@ import (
 //
 //	go cfg.Watch(ctx)
 func New[T any](opts ...Option[T]) (*Config[T], error) {
+	return build(viper.New(), false, opts)
+}
+
+// NewSealed builds a Config with its own Viper instance and keeps it
+// unreachable: Viper returns nil, and nothing holding the Config can read,
+// mutate or replace the engine underneath it.
+//
+//	cfg, err := dynamicconfig.NewSealed[AppConfig](
+//	    dynamicconfig.WithViperSetup[AppConfig](func(v *viper.Viper) error {
+//	        v.SetConfigFile("/etc/myapp/config.yaml")
+//	        v.SetEnvPrefix("MYAPP")
+//	        v.AutomaticEnv()
+//
+//	        return nil
+//	    }),
+//	    dynamicconfig.WithValidator(validateConfig),
+//	)
+//
+// Everything else behaves identically to New. The engine is still
+// configurable — during construction, through the options and
+// WithViperSetup, which is the only moment at which configuring it is safe
+// anyway.
+//
+// Seal a Config when it will be handed to code that should depend on the
+// configuration rather than on the machinery behind it. It removes two
+// classes of problem outright: a second configuration API spreading through
+// an application as cfg.Viper().GetString calls, and a goroutine reading
+// the engine while a reload writes it, which Viper does not synchronise and
+// this package cannot synchronise on its behalf.
+func NewSealed[T any](opts ...Option[T]) (*Config[T], error) {
 	return build(viper.New(), true, opts)
 }
 
-// Wrap adopts an existing Viper instance and performs the initial load.
+// Wrap adopts an existing Viper instance, keeps it reachable through Viper,
+// and performs the initial load.
 //
 // This is the migration path for an application that already configures
 // Viper — defaults, environment prefix, search paths, aliases — and wants
@@ -52,7 +101,7 @@ func New[T any](opts ...Option[T]) (*Config[T], error) {
 //	cfg, err := dynamicconfig.Wrap[AppConfig](v, dynamicconfig.WithValidator(validate))
 //
 // The Config takes over reading and decoding through that instance. It does
-// not take ownership of it: the caller must stop mutating it from other
+// not take ownership of it: the caller must stop using it from other
 // goroutines once reloads can run, because Viper does no locking of its
 // own.
 //
@@ -67,7 +116,33 @@ func Wrap[T any](v *viper.Viper, opts ...Option[T]) (*Config[T], error) {
 	return build(v, false, opts)
 }
 
-func build[T any](v *viper.Viper, owned bool, opts []Option[T]) (*Config[T], error) {
+// WrapSealed adopts an existing Viper instance and seals it: the Config
+// gives nothing back, and Viper returns nil.
+//
+// The caller obviously still holds the instance it passed in — no library
+// can take that away. What sealing does is stop the Config from being a
+// route to it, which is what matters at a package boundary:
+//
+//	func Load() (*dynamicconfig.Config[AppConfig], error) {
+//	    v := viper.New()
+//	    v.SetConfigFile("/etc/myapp/config.yaml")
+//	    v.SetEnvPrefix("MYAPP")
+//	    v.AutomaticEnv()
+//
+//	    return dynamicconfig.WrapSealed[AppConfig](v, dynamicconfig.WithValidator(validate))
+//	}
+//
+// The local v goes out of scope, and every caller of Load receives a
+// configuration with one public interface and no way behind it.
+func WrapSealed[T any](v *viper.Viper, opts ...Option[T]) (*Config[T], error) {
+	if v == nil {
+		return nil, fmt.Errorf("%w: viper instance is nil", ErrInvalidOption)
+	}
+
+	return build(v, true, opts)
+}
+
+func build[T any](v *viper.Viper, sealed bool, opts []Option[T]) (*Config[T], error) {
 	resolved := defaultOptions[T]()
 
 	for i, opt := range opts {
@@ -80,10 +155,6 @@ func build[T any](v *viper.Viper, owned bool, opts []Option[T]) (*Config[T], err
 		}
 	}
 
-	if resolved.configFile != "" {
-		v.SetConfigFile(resolved.configFile)
-	}
-
 	for i, setup := range resolved.viperSetup {
 		if err := setup(v); err != nil {
 			return nil, fmt.Errorf("dynamicconfig: viper setup %d: %w", i, err)
@@ -91,7 +162,8 @@ func build[T any](v *viper.Viper, owned bool, opts []Option[T]) (*Config[T], err
 	}
 
 	cfg := &Config[T]{
-		Viper:     v,
+		viper:     v,
+		sealed:    sealed,
 		reloadSem: make(chan struct{}, 1),
 		life:      lifecycle.New(),
 		opts:      resolved,
@@ -116,7 +188,7 @@ func build[T any](v *viper.Viper, owned bool, opts []Option[T]) (*Config[T], err
 			"dynamicconfig: configuration loaded",
 			"config_file", cfg.configFileUsed(),
 			"generation", cfg.generation.Load(),
-			"owned_viper", owned,
+			"sealed", sealed,
 		)
 	}
 

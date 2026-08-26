@@ -706,3 +706,193 @@ func TestConcurrentReadersDuringReloads(t *testing.T) {
 		t.Fatal("no reload was rejected, so the test proved nothing about rejection")
 	}
 }
+
+// TestWritesOutpacingReloadStayBounded generates changes faster than the
+// reload transaction can retire them.
+//
+// A validator that takes its time is the lever: every reload now costs
+// real milliseconds while writes cost microseconds, so the queue between
+// them is under genuine pressure. What must hold is that the pressure has
+// nowhere to accumulate — one reload runs, at most one waits, and the last
+// write still wins in the end.
+func TestWritesOutpacingReloadStayBounded(t *testing.T) {
+	// Not parallel: it counts goroutines.
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+
+	write(t, path, document("first", 8080))
+
+	var (
+		inFlight atomic.Int64
+		peak     atomic.Int64
+	)
+
+	slowValidator := func(c *config) error {
+		running := inFlight.Add(1)
+
+		defer inFlight.Add(-1)
+
+		for {
+			highest := peak.Load()
+			if running <= highest || peak.CompareAndSwap(highest, running) {
+				break
+			}
+		}
+
+		// Slow enough that writes comfortably outpace reloads.
+		time.Sleep(5 * time.Millisecond)
+
+		return validate(c)
+	}
+
+	cfg, _ := start(t, path,
+		dynamicconfig.WithValidator(slowValidator),
+		dynamicconfig.WithDebounce[config](0),
+	)
+
+	goroutinesBefore := runtime.NumGoroutine()
+
+	for i := range 200 {
+		write(t, path, document("outpaced", 9000+(i%50)))
+	}
+
+	write(t, path, document("last", 9100))
+
+	waitFor(t, func() bool { return cfg.Current().Value == "last" }, "the last write to win")
+
+	// Serialisation is the first bound: two reloads never overlap, so a
+	// storm cannot multiply the work in flight.
+	if got := peak.Load(); got > 1 {
+		t.Fatalf("%d reloads ran concurrently; reloads must be serialised", got)
+	}
+
+	// Coalescing is the second: the events that arrived while a reload
+	// was running collapsed into at most one further reload, rather than
+	// into a queue that grows with the event rate.
+	waitFor(t, func() bool {
+		return runtime.NumGoroutine()-goroutinesBefore <= 10
+	}, "goroutines to settle after writes outpaced reloads")
+
+	status := cfg.Status()
+
+	if status.Generation != status.SuccessfulReloads+1 {
+		t.Fatalf("generation %d does not match %d successful reloads plus the initial load",
+			status.Generation, status.SuccessfulReloads)
+	}
+}
+
+// TestWatchingEveryLayer proves a layered configuration watches all of its
+// files: a change to any one of them reloads the whole set, and the layering
+// still applies afterwards.
+func TestWatchingEveryLayer(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+	secret := filepath.Join(dir, "secret.yaml")
+
+	write(t, base, "value: base\nport: 8080\n")
+	write(t, secret, "port: 9443\n")
+
+	cfg, err := dynamicconfig.New[config](
+		dynamicconfig.WithConfigFile[config](base),
+		dynamicconfig.WithConfigFile[config](secret),
+		dynamicconfig.WithValidator(validate),
+		dynamicconfig.WithDebounce[config](20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stopped := make(chan error, 1)
+
+	go func() { stopped <- cfg.Watch(ctx) }()
+
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+		_ = cfg.Close()
+	})
+
+	waitFor(t, func() bool { return cfg.Status().Watching }, "the watcher to start")
+
+	if got := cfg.Current().Port; got != 9443 {
+		t.Fatalf("port = %d, want the upper layer's value", got)
+	}
+
+	// A change to the lower layer.
+	write(t, base, "value: base-changed\nport: 8080\n")
+
+	waitFor(t, func() bool { return cfg.Current().Value == "base-changed" }, "the base layer change")
+
+	if got := cfg.Current().Port; got != 9443 {
+		t.Fatalf("port = %d: the upper layer stopped applying after a base reload", got)
+	}
+
+	// A change to the upper layer.
+	write(t, secret, "port: 9444\n")
+
+	waitFor(t, func() bool { return cfg.Current().Port == 9444 }, "the upper layer change")
+
+	if got := cfg.Current().Value; got != "base-changed" {
+		t.Fatalf("value = %q: the base layer was lost after an upper reload", got)
+	}
+}
+
+// TestLayersInSeparateDirectories covers the deployment where a secret is
+// mounted somewhere else entirely — a Kubernetes Secret volume next to a
+// ConfigMap volume, most often — so the watcher has two directories to
+// follow rather than one.
+func TestLayersInSeparateDirectories(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	secretDir := t.TempDir()
+
+	base := filepath.Join(configDir, "config.yaml")
+	secret := filepath.Join(secretDir, "secret.yaml")
+
+	write(t, base, "value: base\nport: 8080\n")
+	write(t, secret, "port: 9443\n")
+
+	cfg, err := dynamicconfig.New[config](
+		dynamicconfig.WithConfigFile[config](base),
+		dynamicconfig.WithConfigFile[config](secret),
+		dynamicconfig.WithValidator(validate),
+		dynamicconfig.WithDebounce[config](20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stopped := make(chan error, 1)
+
+	go func() { stopped <- cfg.Watch(ctx) }()
+
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+		_ = cfg.Close()
+	})
+
+	waitFor(t, func() bool { return cfg.Status().Watching }, "the watcher to start")
+
+	// Each directory is watched, so a rename-into-place in either one is
+	// noticed.
+	replace(t, secret, "port: 9445\n")
+
+	waitFor(t, func() bool { return cfg.Current().Port == 9445 }, "the secret directory change")
+
+	replace(t, base, "value: elsewhere\nport: 8080\n")
+
+	waitFor(t, func() bool { return cfg.Current().Value == "elsewhere" }, "the config directory change")
+
+	if got := cfg.Current().Port; got != 9445 {
+		t.Fatalf("port = %d: layering broke across directories", got)
+	}
+}

@@ -73,7 +73,7 @@ jobs:
         run: go vet ./...
 
       - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: make staticcheck
 
       - name: Tests under the race detector
         run: go test -race -count=1 ./...
@@ -81,7 +81,7 @@ jobs:
       - name: Fuzz smoke
         run: |
           go test -run '^$' -fuzz FuzzReloadDocument -fuzztime 60s .
-          go test -run '^$' -fuzz FuzzSubscriberOperations -fuzztime 60s .
+          go test -run '^$' -fuzz FuzzLifecycleModel -fuzztime 60s .
 
       - name: Allocation assertions
         run: go test -count=1 -run TestCurrentDoesNotAllocate ./benchmarks/
@@ -90,7 +90,7 @@ jobs:
         run: go build -o /dev/null ./examples/...
 
       - name: Vulnerabilities
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: make vuln
 
   publish:
     name: publish the release
@@ -121,7 +121,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}

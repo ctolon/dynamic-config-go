@@ -84,15 +84,19 @@ func (c *Config[T]) Watch(ctx context.Context) error {
 		return ErrNoSnapshot
 	}
 
-	path := c.configFileUsed()
-	if path == "" {
+	files := c.configFilesUsed()
+	if len(files) == 0 {
 		return ErrNoConfigFile
 	}
 
-	return c.watch(ctx, filepath.Clean(path))
+	for i := range files {
+		files[i] = filepath.Clean(files[i])
+	}
+
+	return c.watch(ctx, files)
 }
 
-func (c *Config[T]) watch(ctx context.Context, path string) error {
+func (c *Config[T]) watch(ctx context.Context, files []string) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("dynamicconfig: watch: create watcher: %w", err)
@@ -100,14 +104,20 @@ func (c *Config[T]) watch(ctx context.Context, path string) error {
 
 	defer func() { _ = watcher.Close() }()
 
-	dir := filepath.Dir(path)
+	watched := newWatchSet(files)
 
-	// The directory is watched rather than the file. A file watch follows
-	// an inode, and every realistic update — rename-into-place, a
+	// Directories are watched rather than files. A file watch follows an
+	// inode, and every realistic update — rename-into-place, a
 	// projected-volume swap, delete-and-recreate — replaces the inode.
 	// Watching the directory survives all three.
-	if err := watcher.Add(dir); err != nil {
-		return fmt.Errorf("dynamicconfig: watch: watch directory %s: %w", dir, err)
+	//
+	// A layered configuration usually has all its files in one directory,
+	// so this is normally one watch; when it is not, each directory is
+	// watched once however many files it holds.
+	for _, dir := range watched.dirs {
+		if err := watcher.Add(dir); err != nil {
+			return fmt.Errorf("dynamicconfig: watch: watch directory %s: %w", dir, err)
+		}
 	}
 
 	watchCtx, cancel := context.WithCancel(ctx)
@@ -137,7 +147,7 @@ func (c *Config[T]) watch(ctx context.Context, path string) error {
 	// covers the window between the initial load and the line above. The
 	// stamp comparison keeps a watcher from republishing a configuration
 	// that never changed.
-	if c.fileChangedSinceLoad() {
+	if c.filesChangedSinceLoad() {
 		debouncer.Trigger()
 	}
 
@@ -148,7 +158,7 @@ func (c *Config[T]) watch(ctx context.Context, path string) error {
 
 	defer c.watching.Store(false)
 
-	err = c.watchLoop(watchCtx, watcher, path, dir, debouncer)
+	err = c.watchLoop(watchCtx, watcher, watched, debouncer)
 
 	cancel()
 	workers.Wait()
@@ -177,13 +187,13 @@ func (c *Config[T]) cancelOnClose(ctx context.Context, cancel context.CancelFunc
 func (c *Config[T]) watchLoop(
 	ctx context.Context,
 	watcher *fsnotify.Watcher,
-	path string,
-	dir string,
+	watched watchSet,
 	debouncer *debounce.Debouncer,
 ) error {
 	var (
 		retryTimer *time.Timer
 		retryC     <-chan time.Time
+		lost       []string
 	)
 
 	defer func() {
@@ -223,11 +233,13 @@ func (c *Config[T]) watchLoop(
 				return errors.New("dynamicconfig: watch: event stream closed")
 			}
 
-			if relevant(event, path, dir) {
+			if watched.relevant(event) {
 				debouncer.Trigger()
 			}
 
-			if removedDirectory(event, dir) {
+			if dir, ok := watched.removedDirectory(event); ok {
+				lost = append(lost, dir)
+
 				scheduleRewatch()
 			}
 
@@ -246,28 +258,65 @@ func (c *Config[T]) watchLoop(
 		case <-retryC:
 			retryC = nil
 
-			if err := watcher.Add(dir); err != nil {
-				scheduleRewatch()
+			var stillLost []string
 
-				continue
+			for _, dir := range lost {
+				if err := watcher.Add(dir); err != nil {
+					stillLost = append(stillLost, dir)
+				}
 			}
 
-			// The directory came back. Whatever happened while it was
-			// gone was missed, so reload unconditionally.
+			lost = stillLost
+
+			if len(lost) > 0 {
+				scheduleRewatch()
+			}
+
+			// Whatever happened while a directory was gone was missed,
+			// so reload unconditionally.
 			debouncer.Trigger()
 		}
 	}
 }
 
+// watchSet is the files a watcher follows and the directories it has to
+// watch to see them.
+type watchSet struct {
+	files map[string]struct{}
+	dirs  []string
+}
+
+func newWatchSet(files []string) watchSet {
+	set := watchSet{files: make(map[string]struct{}, len(files))}
+
+	seen := make(map[string]struct{}, len(files))
+
+	for _, path := range files {
+		set.files[path] = struct{}{}
+
+		dir := filepath.Dir(path)
+
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+
+		seen[dir] = struct{}{}
+
+		set.dirs = append(set.dirs, dir)
+	}
+
+	return set
+}
+
 // relevant decides whether an event concerns the configuration.
 //
-// Events for unrelated files in the same directory are ignored — watching a
-// directory is a means to an end, not a licence to reload whenever a
+// Events for unrelated files in a watched directory are ignored — watching
+// a directory is a means to an end, not a licence to reload whenever a
 // neighbour changes.
-func relevant(event fsnotify.Event, path, dir string) bool {
+func (w watchSet) relevant(event fsnotify.Event) bool {
 	name := filepath.Clean(event.Name)
 
-	if name == path {
+	if _, ok := w.files[name]; ok {
 		return true
 	}
 
@@ -277,16 +326,32 @@ func relevant(event fsnotify.Event, path, dir string) bool {
 		return true
 	}
 
-	// The directory itself being replaced takes the file with it.
-	return name == dir
-}
-
-func removedDirectory(event fsnotify.Event, dir string) bool {
-	if filepath.Clean(event.Name) != dir {
-		return false
+	// A watched directory being replaced takes its files with it.
+	for _, dir := range w.dirs {
+		if name == dir {
+			return true
+		}
 	}
 
-	return event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)
+	return false
+}
+
+// removedDirectory reports a watched directory disappearing, which is the
+// one case a directory watch cannot recover from on its own.
+func (w watchSet) removedDirectory(event fsnotify.Event) (string, bool) {
+	if !event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
+		return "", false
+	}
+
+	name := filepath.Clean(event.Name)
+
+	for _, dir := range w.dirs {
+		if name == dir {
+			return dir, true
+		}
+	}
+
+	return "", false
 }
 
 func (c *Config[T]) emitWatchError(err error) {

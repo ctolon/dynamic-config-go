@@ -235,8 +235,12 @@ func TestWrapAdoptsExistingViper(t *testing.T) {
 
 	defer func() { _ = cfg.Close() }()
 
-	if cfg.Viper != v {
+	if cfg.Viper() != v {
 		t.Fatal("Wrap replaced the caller's Viper instance")
+	}
+
+	if cfg.Sealed() {
+		t.Fatal("Wrap produced a sealed configuration")
 	}
 
 	if !cfg.Current().Features["gamma"] {
@@ -694,9 +698,9 @@ func TestViperStateAndSnapshotAreDistinct(t *testing.T) {
 
 	cfg, _ := newTestConfig(t)
 
-	cfg.Viper.Set("server.port", -1)
+	cfg.Viper().Set("server.port", -1)
 
-	if got := cfg.Viper.GetInt("server.port"); got != -1 {
+	if got := cfg.Viper().GetInt("server.port"); got != -1 {
 		t.Fatalf("viper port = %d, want the value just set", got)
 	}
 
@@ -729,4 +733,232 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 	}
 
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// A layered configuration: one struct, one instance, several files, later
+// files overriding earlier ones. It is the shape a deployment usually
+// wants — a checked-in base, a secret mounted separately, an optional local
+// override — without giving up a single snapshot, a single validation or a
+// single generation.
+
+const layeredBase = `
+server:
+  host: localhost
+  port: 8080
+features:
+  beta: false
+`
+
+func TestLayeredFilesMergeInOrder(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+	secret := filepath.Join(dir, "secret.yaml")
+
+	writeConfig(t, base, layeredBase)
+	writeConfig(t, secret, "server:\n  port: 9443\nfeatures:\n  beta: true\n")
+
+	cfg, err := dynamicconfig.New[appConfig](
+		dynamicconfig.WithConfigFile[appConfig](base),
+		dynamicconfig.WithConfigFile[appConfig](secret),
+		dynamicconfig.WithValidator(validPort),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = cfg.Close() }()
+
+	current := cfg.Current()
+
+	// The later file wins where they overlap...
+	if current.Server.Port != 9443 {
+		t.Fatalf("port = %d, want 9443 from the second file", current.Server.Port)
+	}
+
+	if !current.Features["beta"] {
+		t.Fatal("the second file did not override the first")
+	}
+
+	// ...and leaves alone what it does not mention.
+	if current.Server.Host != "localhost" {
+		t.Fatalf("host = %q, want the base file's value", current.Server.Host)
+	}
+
+	status := cfg.Status()
+
+	if got := status.ConfigFiles; len(got) != 2 || got[0] != base || got[1] != secret {
+		t.Fatalf("status files = %v, want both in layering order", got)
+	}
+
+	if status.ConfigFile != base {
+		t.Fatalf("primary file = %q, want the first layer", status.ConfigFile)
+	}
+
+	// One generation, however many files it came from.
+	if status.Generation != 1 {
+		t.Fatalf("generation = %d, want 1", status.Generation)
+	}
+}
+
+func TestLayeredReloadRereadsEveryFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+	secret := filepath.Join(dir, "secret.yaml")
+
+	writeConfig(t, base, layeredBase)
+	writeConfig(t, secret, "server:\n  port: 9443\n")
+
+	cfg, err := dynamicconfig.New[appConfig](
+		dynamicconfig.WithConfigFile[appConfig](base),
+		dynamicconfig.WithConfigFile[appConfig](secret),
+		dynamicconfig.WithValidator(validPort),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = cfg.Close() }()
+
+	// A change to the lower layer that the upper one does not override.
+	writeConfig(t, base, "server:\n  host: changed\n  port: 8080\n")
+
+	if err := cfg.Reload(t.Context()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if got := cfg.Current().Server.Host; got != "changed" {
+		t.Fatalf("host = %q, want the base file's new value", got)
+	}
+
+	if got := cfg.Current().Server.Port; got != 9443 {
+		t.Fatalf("port = %d: the upper layer stopped applying", got)
+	}
+
+	// A key removed from the upper layer stops overriding, rather than
+	// surviving from the previous read.
+	writeConfig(t, secret, "features:\n  beta: true\n")
+
+	if err := cfg.Reload(t.Context()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if got := cfg.Current().Server.Port; got != 8080 {
+		t.Fatalf("port = %d, want the base value once the override was removed", got)
+	}
+}
+
+func TestOptionalLayerMayBeAbsent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+	local := filepath.Join(dir, "config.local.yaml")
+
+	writeConfig(t, base, layeredBase)
+
+	cfg, err := dynamicconfig.New[appConfig](
+		dynamicconfig.WithConfigFile[appConfig](base),
+		dynamicconfig.WithOptionalConfigFile[appConfig](local),
+		dynamicconfig.WithValidator(validPort),
+	)
+	if err != nil {
+		t.Fatalf("New with an absent optional layer: %v", err)
+	}
+
+	defer func() { _ = cfg.Close() }()
+
+	if got := cfg.Current().Server.Port; got != 8080 {
+		t.Fatalf("port = %d, want the base value", got)
+	}
+
+	if got := cfg.Status().ConfigFiles; len(got) != 1 {
+		t.Fatalf("status files = %v, want only the file that exists", got)
+	}
+
+	// The layer appearing later is picked up by the next reload.
+	writeConfig(t, local, "server:\n  port: 9999\n")
+
+	if err := cfg.Reload(t.Context()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if got := cfg.Current().Server.Port; got != 9999 {
+		t.Fatalf("port = %d, want the optional layer's value", got)
+	}
+
+	if got := cfg.Status().ConfigFiles; len(got) != 2 {
+		t.Fatalf("status files = %v, want both once the optional layer exists", got)
+	}
+}
+
+func TestRequiredLayerMissingFailsFast(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+
+	writeConfig(t, base, layeredBase)
+
+	_, err := dynamicconfig.New[appConfig](
+		dynamicconfig.WithConfigFile[appConfig](base),
+		dynamicconfig.WithConfigFile[appConfig](filepath.Join(dir, "absent.yaml")),
+	)
+	if err == nil {
+		t.Fatal("New succeeded with a required layer missing")
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error does not wrap os.ErrNotExist: %v", err)
+	}
+}
+
+func TestDeletedLayerKeepsLastKnownGood(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	base := filepath.Join(dir, "config.yaml")
+	secret := filepath.Join(dir, "secret.yaml")
+
+	writeConfig(t, base, layeredBase)
+	writeConfig(t, secret, "server:\n  port: 9443\n")
+
+	cfg, err := dynamicconfig.New[appConfig](
+		dynamicconfig.WithConfigFile[appConfig](base),
+		dynamicconfig.WithConfigFile[appConfig](secret),
+		dynamicconfig.WithValidator(validPort),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = cfg.Close() }()
+
+	good := cfg.Current()
+
+	// A secret file that disappears must not silently demote the service
+	// to whatever the base file says.
+	if err := os.Remove(secret); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if err := cfg.Reload(t.Context()); err == nil {
+		t.Fatal("a deleted required layer was accepted")
+	}
+
+	if cfg.Current() != good {
+		t.Fatal("a deleted layer disturbed the published snapshot")
+	}
+
+	if got := cfg.Current().Server.Port; got != 9443 {
+		t.Fatalf("port = %d: the service fell back to the base file", got)
+	}
 }

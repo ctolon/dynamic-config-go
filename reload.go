@@ -45,15 +45,21 @@ func (c *Config[T]) Reload(ctx context.Context) error {
 // concurrent reloads nor a dispatch — there is no other goroutine and there
 // are no subscribers yet.
 func (c *Config[T]) initialLoad() error {
-	_, failure := c.runTransaction(ReloadSourceInitial)
-	if failure != nil {
+	_, err := c.runTransaction(ReloadSourceInitial)
+	if err == nil {
+		return nil
+	}
+
+	var failure *ReloadError
+
+	if errors.As(err, &failure) {
 		c.failedReloads.Add(1)
 		storeTime(&c.lastFailure, failure.Time)
 
 		return fmt.Errorf("dynamicconfig: initial load: %w", failure.Err)
 	}
 
-	return nil
+	return fmt.Errorf("dynamicconfig: initial load: %w", err)
 }
 
 func (c *Config[T]) doReload(ctx context.Context, source ReloadSource) error {
@@ -82,7 +88,7 @@ func (c *Config[T]) doReload(ctx context.Context, source ReloadSource) error {
 		return ErrClosed
 	}
 
-	change, failure := c.runTransaction(source)
+	change, err := c.runTransaction(source)
 
 	// Release before anything that touches user code or user-visible
 	// queues. Invariant: no subscriber callback ever runs while the
@@ -90,10 +96,20 @@ func (c *Config[T]) doReload(ctx context.Context, source ReloadSource) error {
 	// deadlocking.
 	<-c.reloadSem
 
-	if failure != nil {
-		c.reportFailure(*failure)
+	if err != nil {
+		var failure *ReloadError
 
-		return fmt.Errorf("dynamicconfig: reload: %w", failure.Err)
+		// A rejected candidate is a reload failure: counted, reported,
+		// and survivable. Anything else — today, only a Close that won
+		// the race to the commit — is not a verdict on the
+		// configuration and is neither counted nor reported.
+		if errors.As(err, &failure) {
+			c.reportFailure(*failure)
+
+			return fmt.Errorf("dynamicconfig: reload: %w", failure.Err)
+		}
+
+		return err
 	}
 
 	c.dispatchChange(change)
@@ -101,12 +117,15 @@ func (c *Config[T]) doReload(ctx context.Context, source ReloadSource) error {
 	return nil
 }
 
-// runTransaction performs one reload attempt. It returns either the
-// published change or the failure that stopped it, never both. The caller
-// holds the reload semaphore (or is the initial load, which has no
-// competition).
-func (c *Config[T]) runTransaction(source ReloadSource) (Change[T], *ReloadError) {
-	fail := func(stage ReloadStage, err error) *ReloadError {
+// runTransaction performs one reload attempt. The caller holds the reload
+// semaphore, or is the initial load, which has no competition.
+//
+// It returns either the published change or an error. A rejected candidate
+// is reported as a *ReloadError naming the stage that refused it; a
+// shutdown that won the race to the commit is reported as ErrClosed, which
+// is not a verdict on the configuration and is not counted as a failure.
+func (c *Config[T]) runTransaction(source ReloadSource) (Change[T], error) {
+	fail := func(stage ReloadStage, err error) error {
 		return &ReloadError{
 			Err:        err,
 			Stage:      stage,
@@ -116,29 +135,61 @@ func (c *Config[T]) runTransaction(source ReloadSource) (Change[T], *ReloadError
 		}
 	}
 
-	if err := c.readIntoViper(); err != nil {
+	read, err := c.readIntoViper()
+	if err != nil {
 		return Change[T]{}, fail(StageRead, err)
 	}
 
 	next := new(T)
 
-	if err := c.Viper.Unmarshal(next, c.opts.decodeOptions...); err != nil {
+	if err := c.viper.Unmarshal(next, c.opts.decodeOptions...); err != nil {
 		return Change[T]{}, fail(StageDecode, fmt.Errorf("decode configuration into %T: %w", *next, err))
 	}
 
-	if c.opts.validator != nil {
-		if err := c.opts.validator(next); err != nil {
-			return Change[T]{}, fail(StageValidation, fmt.Errorf("validate configuration: %w", err))
-		}
+	if err := c.validate(next); err != nil {
+		return Change[T]{}, fail(StageValidation, err)
 	}
 
-	// Everything that can fail has now succeeded. Publication is the last
-	// step and cannot fail, which is why readers only ever observe
-	// snapshots that passed all of it.
+	// Everything that can fail has now succeeded, and none of it happened
+	// under a lock.
+	change, err := c.commit(next, read, source)
+	if err != nil {
+		return Change[T]{}, err
+	}
+
+	if c.opts.logger != nil {
+		// Stages, counters and paths — never values.
+		c.opts.logger.Info(
+			"dynamicconfig: configuration published",
+			"generation", change.Generation,
+			"source", string(source),
+			"config_file", c.configFileUsed(),
+		)
+	}
+
+	return change, nil
+}
+
+// commit is the publication point, and the only place a snapshot becomes
+// visible.
+//
+// It runs under the publication gate, which it shares with the transition
+// to closing — so a snapshot and a shutdown cannot interleave: one of them
+// is first, and after Close wins, nothing else is ever published. The
+// section holds no file, no decoder and no user code, only the few stores
+// that make a generation visible.
+func (c *Config[T]) commit(next *T, read readResult, source ReloadSource) (Change[T], error) {
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	if c.closed() {
+		return Change[T]{}, ErrClosed
+	}
+
 	previous := c.current.Load()
+	now := time.Now()
 
 	generation := c.generation.Add(1)
-	now := time.Now()
 
 	c.current.Store(next)
 
@@ -148,16 +199,13 @@ func (c *Config[T]) runTransaction(source ReloadSource) (Change[T], *ReloadError
 		c.successfulReloads.Add(1)
 	}
 
-	c.recordFileStamp()
-
-	if c.opts.logger != nil {
-		// Stages, counters and paths — never values.
-		c.opts.logger.Info(
-			"dynamicconfig: configuration published",
-			"generation", generation,
-			"source", string(source),
-			"config_file", c.configFileUsed(),
-		)
+	// The stamps were taken from the files this candidate was read from,
+	// so they belong to the snapshot rather than to whatever those files
+	// happen to be now — and committing them here means a rejected
+	// candidate never moves them.
+	if read.files != nil {
+		c.configFiles.Store(&read.files)
+		c.fileStamps.Store(&read.stamps)
 	}
 
 	return Change[T]{
@@ -169,32 +217,148 @@ func (c *Config[T]) runTransaction(source ReloadSource) (Change[T], *ReloadError
 	}, nil
 }
 
-// readIntoViper performs the read stage.
+// validate runs the validator, if there is one, with panic isolation.
 //
-// A missing file is tolerated only when the configuration was told its file
-// is optional and has never had one. Once a file has been read
-// successfully, its disappearance is a failure — a deleted ConfigMap must
-// not silently demote a running service to its defaults.
-func (c *Config[T]) readIntoViper() error {
-	if err := c.Viper.ReadInConfig(); err != nil {
-		if c.tolerateMissingFile(err) {
-			return nil
-		}
-
-		return fmt.Errorf("read configuration: %w", err)
+// A validator is application code on a recoverable path. A panic in one is
+// a rejected candidate — the same outcome as a returned error, with the
+// same consequence, which is that the running configuration stays exactly
+// where it was — rather than a process that dies because somebody
+// dereferenced a nil pointer in a rule about port ranges.
+func (c *Config[T]) validate(next *T) (err error) {
+	if c.opts.validator == nil {
+		return nil
 	}
 
-	c.setConfigFileUsed(c.Viper.ConfigFileUsed())
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+
+		c.logPanic("validator", recovered, debug.Stack())
+
+		err = fmt.Errorf("validate configuration: validator panicked: %v", recovered)
+	}()
+
+	if verr := c.opts.validator(next); verr != nil {
+		return fmt.Errorf("validate configuration: %w", verr)
+	}
 
 	return nil
 }
 
+// readResult is what the read stage produced: the files that were actually
+// read, in layering order, and a stamp for each.
+type readResult struct {
+	files  []string
+	stamps map[string]fileStamp
+}
+
+// readIntoViper performs the read stage.
+//
+// With no files named, Viper's own discovery decides. With files named,
+// they are layered in the order the options gave them: the first one that
+// is present is read, replacing whatever Viper held — which is what stops a
+// key deleted from a file surviving into the next snapshot — and the rest
+// are merged over it, so a later file wins a conflict.
+//
+// A file marked optional may be absent. Anything else missing, unreadable
+// or unparseable fails the stage, and a failed stage leaves the published
+// snapshot exactly where it was: a deleted secrets file must not silently
+// demote a running service to its defaults.
+func (c *Config[T]) readIntoViper() (readResult, error) {
+	if len(c.opts.configFiles) == 0 {
+		return c.readDiscovered()
+	}
+
+	result := readResult{stamps: make(map[string]fileStamp, len(c.opts.configFiles))}
+
+	for _, file := range c.opts.configFiles {
+		stamp, err := statStamp(file.path)
+		if err != nil {
+			if file.optional && errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+
+			return readResult{}, fmt.Errorf("read configuration %s: %w", file.path, err)
+		}
+
+		c.viper.SetConfigFile(file.path)
+
+		// The first file read replaces Viper's state; the rest merge
+		// into it.
+		if len(result.files) == 0 {
+			err = c.viper.ReadInConfig()
+		} else {
+			err = c.viper.MergeInConfig()
+		}
+
+		if err != nil {
+			return readResult{}, fmt.Errorf("read configuration %s: %w", file.path, err)
+		}
+
+		result.files = append(result.files, file.path)
+		result.stamps[file.path] = *stamp
+	}
+
+	if len(result.files) == 0 {
+		// Every named file was optional and every one of them was
+		// absent. Tolerating that silently would mean publishing
+		// whatever Viper still held from the previous reload.
+		if c.opts.allowMissingFile && len(c.configFilesUsed()) == 0 {
+			return readResult{}, nil
+		}
+
+		return readResult{}, errors.New("read configuration: none of the configured files exist")
+	}
+
+	return result, nil
+}
+
+// readDiscovered is the path for a Viper instance that finds its own file
+// through a config name and search paths.
+func (c *Config[T]) readDiscovered() (readResult, error) {
+	if err := c.viper.ReadInConfig(); err != nil {
+		if c.tolerateMissingFile(err) {
+			return readResult{}, nil
+		}
+
+		return readResult{}, fmt.Errorf("read configuration: %w", err)
+	}
+
+	path := c.viper.ConfigFileUsed()
+	if path == "" {
+		return readResult{}, nil
+	}
+
+	result := readResult{
+		files:  []string{path},
+		stamps: make(map[string]fileStamp, 1),
+	}
+
+	// Taken next to the read, so that the stamp describes the file this
+	// candidate came from. A stat and a read are not atomic against an
+	// external writer, so this is best-effort by nature — it exists to
+	// close the load/watch gap, not to detect every possible change.
+	stamp, err := statStamp(path)
+	if err != nil {
+		return result, nil
+	}
+
+	result.stamps[path] = *stamp
+
+	return result, nil
+}
+
+// tolerateMissingFile decides whether Viper finding nothing at all is
+// allowed. It covers only the discovery path: a named file that may be
+// absent is said so with WithOptionalConfigFile.
 func (c *Config[T]) tolerateMissingFile(err error) bool {
 	if !c.opts.allowMissingFile {
 		return false
 	}
 
-	if c.configFileUsed() != "" {
+	if len(c.configFilesUsed()) != 0 {
 		return false
 	}
 
@@ -215,20 +379,6 @@ type fileStamp struct {
 	mode    uint32
 }
 
-func (c *Config[T]) recordFileStamp() {
-	path := c.configFileUsed()
-	if path == "" {
-		return
-	}
-
-	stamp, err := statStamp(path)
-	if err != nil {
-		return
-	}
-
-	c.fileStamp.Store(stamp)
-}
-
 func statStamp(path string) (*fileStamp, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -242,27 +392,38 @@ func statStamp(path string) (*fileStamp, error) {
 	}, nil
 }
 
-// fileChangedSinceLoad reports whether the file on disk differs from the
-// one the published snapshot came from. A stat error counts as changed: if
-// the file cannot be examined, the safe assumption is that a reload is
+// filesChangedSinceLoad reports whether any file on disk differs from the
+// one the published snapshot was read from. A stat error counts as changed:
+// if a file cannot be examined, the safe assumption is that a reload is
 // owed.
-func (c *Config[T]) fileChangedSinceLoad() bool {
-	path := c.configFileUsed()
-	if path == "" {
+func (c *Config[T]) filesChangedSinceLoad() bool {
+	files := c.configFilesUsed()
+	if len(files) == 0 {
 		return false
 	}
 
-	recorded := c.fileStamp.Load()
+	recorded := c.fileStamps.Load()
 	if recorded == nil {
 		return true
 	}
 
-	current, err := statStamp(path)
-	if err != nil {
-		return true
+	for _, path := range files {
+		previous, ok := (*recorded)[path]
+		if !ok {
+			return true
+		}
+
+		current, err := statStamp(path)
+		if err != nil {
+			return true
+		}
+
+		if *current != previous {
+			return true
+		}
 	}
 
-	return *current != *recorded
+	return false
 }
 
 // reportFailure records a rejected reload and tells the error subscribers.

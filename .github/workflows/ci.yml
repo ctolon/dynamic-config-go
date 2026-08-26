@@ -77,7 +77,7 @@ jobs:
         run: go vet ./...
 
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: make staticcheck
 
       - name: go mod tidy is clean
         run: |
@@ -98,8 +98,8 @@ jobs:
       - name: Fuzz the reload boundary
         run: go test -run '^$' -fuzz FuzzReloadDocument -fuzztime 60s .
 
-      - name: Fuzz subscriber operations
-        run: go test -run '^$' -fuzz FuzzSubscriberOperations -fuzztime 60s .
+      - name: Fuzz the lifecycle model
+        run: go test -run '^$' -fuzz FuzzLifecycleModel -fuzztime 60s .
 
       - name: Upload failing corpus
         if: failure()

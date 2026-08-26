@@ -102,8 +102,14 @@ func (d *Dispatcher) Dropped() uint64 {
 }
 
 // Stop shuts the worker down, waiting up to timeout for a task that is
-// already running to return. Queued-but-unstarted tasks are abandoned:
-// shutdown must be bounded even when a subscriber is not.
+// already running to return. Queued tasks are abandoned: shutdown must be
+// bounded even when a subscriber is not.
+//
+// The contract is deliberately the honest one rather than the tidy one: no
+// task starts after the worker has observed the stop, but a task that was
+// already dequeued, or one that reaches the worker in the same instant the
+// stop does, may still run. Promising instantaneous cancellation would
+// require a gate on every dequeue to buy a guarantee nobody can observe.
 //
 // It reports whether the worker finished within the timeout. Stop is
 // idempotent; later calls report the same answer as the first once the
@@ -139,6 +145,18 @@ func (d *Dispatcher) run() {
 	defer close(d.finished)
 
 	for {
+		// Check for shutdown before looking at the queue at all. A
+		// single select over both would let Go pick either when both
+		// are ready, so a full queue could keep starting callbacks for
+		// an unbounded time after Stop. This makes shutdown win
+		// whenever it is already visible, which is what "queued work is
+		// abandoned" has to mean to be worth documenting.
+		select {
+		case <-d.quit:
+			return
+		default:
+		}
+
 		select {
 		case <-d.quit:
 			return

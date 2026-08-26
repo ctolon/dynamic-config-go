@@ -51,9 +51,15 @@ type Status struct {
 	// Closed reports whether Close has been called.
 	Closed bool
 
-	// ConfigFile is the file Viper last read, or empty for a
-	// configuration that has none.
+	// ConfigFile is the primary configuration file — the first one
+	// layered — or empty for a configuration that has none.
 	ConfigFile string
+
+	// ConfigFiles is every file the published snapshot was read from, in
+	// the order they were layered, later files having overridden earlier
+	// ones. It has one element for the ordinary single-file case, and
+	// none for a configuration built from defaults and the environment.
+	ConfigFiles []string
 
 	// DroppedEvents counts subscriber notifications discarded because the
 	// bounded dispatch queue was full — that is, because a subscriber

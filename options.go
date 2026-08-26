@@ -29,11 +29,18 @@ const (
 	closeTimeout = 5 * time.Second
 )
 
+// configFile is one file the configuration is read from, in the order the
+// options named it.
+type configFile struct {
+	path     string
+	optional bool
+}
+
 // options is the resolved configuration of a Config. It is unexported:
 // every field is set through an Option, so the set of legal states is the
 // set the option functions can produce.
 type options[T any] struct {
-	configFile string
+	configFiles []configFile
 
 	allowMissingFile bool
 
@@ -65,11 +72,25 @@ func defaultOptions[T any]() options[T] {
 // ErrInvalidOption.
 type Option[T any] func(*options[T]) error
 
-// WithConfigFile sets the configuration file to read.
+// WithConfigFile adds a configuration file to read.
 //
 // It is the equivalent of viper.SetConfigFile: the path is used exactly as
-// given, with no search and no name or extension inference. Watch watches
-// this file's directory.
+// given, with no search and no name or extension inference.
+//
+// Calling it more than once builds a layered configuration from several
+// files, read in the order the options were given, with later files
+// overriding keys from earlier ones — the same rule Viper's own merge
+// follows:
+//
+//	dynamicconfig.WithConfigFile[AppConfig]("/etc/myapp/config.yaml"),
+//	dynamicconfig.WithOptionalConfigFile[AppConfig]("/etc/myapp/secrets.yaml"),
+//
+// Every file is required unless it was added with WithOptionalConfigFile. A
+// reload reads all of them, so one transaction publishes one snapshot
+// however many files it came from, and a file that becomes unreadable
+// rejects the whole candidate rather than publishing half of it.
+//
+// Watch watches every file that was read, each in its own directory.
 //
 // For anything more elaborate — a search path, a config name, an explicit
 // format for an extensionless file — use WithViperSetup, or build the Viper
@@ -80,7 +101,33 @@ func WithConfigFile[T any](path string) Option[T] {
 			return fmt.Errorf("%w: config file path is empty", ErrInvalidOption)
 		}
 
-		o.configFile = path
+		o.configFiles = append(o.configFiles, configFile{path: path})
+
+		return nil
+	}
+}
+
+// WithOptionalConfigFile adds a configuration file that may or may not
+// exist.
+//
+// It layers exactly like WithConfigFile — later files override earlier keys
+// — but a missing one is skipped instead of failing the read. This is the
+// shape of a secret file mounted only in some environments, or a local
+// override a developer may not have:
+//
+//	dynamicconfig.WithConfigFile[AppConfig]("config.yaml"),
+//	dynamicconfig.WithOptionalConfigFile[AppConfig]("config.local.yaml"),
+//
+// Missing means absent. A file that exists and cannot be read, or cannot be
+// parsed, is still a failure — the point is to make absence legal, not to
+// paper over a broken file.
+func WithOptionalConfigFile[T any](path string) Option[T] {
+	return func(o *options[T]) error {
+		if path == "" {
+			return fmt.Errorf("%w: config file path is empty", ErrInvalidOption)
+		}
+
+		o.configFiles = append(o.configFiles, configFile{path: path, optional: true})
 
 		return nil
 	}
@@ -177,17 +224,22 @@ func WithDecodeOption[T any](opts ...viper.DecoderConfigOption) Option[T] {
 	}
 }
 
-// WithAllowMissingFile decides what a missing configuration file means at
-// construction.
+// WithAllowMissingFile decides what it means for Viper to find no
+// configuration file at all.
 //
-// By default it is fatal: a service that cannot find its configuration
-// should not start, and startup is the cheapest moment to find out. Allow
-// it when the configuration legitimately comes from defaults and the
-// environment, or when the file is optional by design.
+// It covers the case where nothing was named and nothing was found: no
+// WithConfigFile, and a search path that turned up empty. By default that
+// is fatal — a service that cannot find its configuration should not start,
+// and startup is the cheapest moment to find out. Allow it when the
+// configuration legitimately comes from defaults and the environment.
 //
-// It applies to construction only. Once a snapshot is published, a file
-// that later disappears is always a reload failure and never clears the
-// published snapshot.
+// For a *named* file that may be absent, use WithOptionalConfigFile
+// instead; it says which file is optional rather than making absence legal
+// in general.
+//
+// It applies while no file has ever been read. Once a snapshot has been
+// published from a file, that file disappearing is always a reload failure
+// and never clears the published snapshot.
 func WithAllowMissingFile[T any](allow bool) Option[T] {
 	return func(o *options[T]) error {
 		o.allowMissingFile = allow

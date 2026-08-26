@@ -4,6 +4,16 @@ GO ?= go
 FUZZTIME ?= 30s
 BENCHTIME ?= 200ms
 
+# Analysis tools are pinned, and CI uses these same variables. An @latest
+# here would mean a new upstream release can turn main red without a single
+# change to this repository — a build that is not reproducible is a build
+# that cannot tell you whether your own change broke something.
+#
+# Dependabot does not see these, so they are reviewed and raised by hand
+# when there is a reason to.
+STATICCHECK_VERSION ?= v0.8.1
+GOVULNCHECK_VERSION ?= v1.7.0
+
 .PHONY: all
 all: check
 
@@ -35,7 +45,7 @@ bench-compile:
 .PHONY: fuzz-smoke
 fuzz-smoke:
 	$(GO) test -run '^$$' -fuzz FuzzReloadDocument -fuzztime $(FUZZTIME) .
-	$(GO) test -run '^$$' -fuzz FuzzSubscriberOperations -fuzztime $(FUZZTIME) .
+	$(GO) test -run '^$$' -fuzz FuzzLifecycleModel -fuzztime $(FUZZTIME) .
 
 ## fmt: format the tree
 .PHONY: fmt
@@ -58,12 +68,12 @@ vet:
 ## staticcheck: run staticcheck
 .PHONY: staticcheck
 staticcheck:
-	$(GO) run honnef.co/go/tools/cmd/staticcheck@latest ./...
+	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
 
 ## vuln: scan dependencies for known vulnerabilities
 .PHONY: vuln
 vuln:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 ## tidy: tidy the module
 .PHONY: tidy
