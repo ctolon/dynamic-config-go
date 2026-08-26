@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-26
+
 ### Added
 
 The first release of the library, covering the whole of the intended v1
@@ -71,4 +73,5 @@ something together.
 - Documentation covering design, concurrency, reloading, Kubernetes,
   security, migration from Viper, and troubleshooting.
 
-[Unreleased]: https://github.com/ctolon/dynamic-config-go/commits/main
+[Unreleased]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ctolon/dynamic-config-go/releases/tag/v0.1.0
