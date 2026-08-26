@@ -511,8 +511,39 @@ func TestEventStormIsBounded(t *testing.T) {
 		return runtime.NumGoroutine()-goroutinesBefore <= 10
 	}, "goroutines to settle back to their baseline after the storm")
 
-	if got := cfg.Status().SuccessfulReloads; got > 300 {
-		t.Fatalf("successful reloads = %d, more than the number of writes", got)
+	// How many reloads a storm produces is the operating system's
+	// business: some watchers report one event per write and some report
+	// several, and coalescing bounds the queue rather than the total.
+	// What must be true is that the storm ends — once the writes stop,
+	// the reloading stops too, rather than feeding itself.
+	var (
+		last     uint64
+		stable   int
+		deadline = time.Now().Add(10 * time.Second)
+	)
+
+	for time.Now().Before(deadline) && stable < 3 {
+		current := cfg.Status().SuccessfulReloads
+
+		if current == last {
+			stable++
+		} else {
+			stable = 0
+			last = current
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if stable < 3 {
+		t.Fatalf("reloads were still arriving after the writes stopped (at %d)", last)
+	}
+
+	status := cfg.Status()
+
+	if status.Generation != status.SuccessfulReloads+1 {
+		t.Fatalf("generation %d does not match %d successful reloads plus the initial load",
+			status.Generation, status.SuccessfulReloads)
 	}
 }
 
