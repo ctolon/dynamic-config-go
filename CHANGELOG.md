@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-26
+
 ### Fixed
 
 - `Status().Watching` now reports an *established* watch rather than a
@@ -90,5 +92,6 @@ something together.
 - Documentation covering design, concurrency, reloading, Kubernetes,
   security, migration from Viper, and troubleshooting.
 
-[Unreleased]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.1...HEAD
 [0.1.0]: https://github.com/ctolon/dynamic-config-go/releases/tag/v0.1.0
+[0.1.1]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.0...v0.1.1
