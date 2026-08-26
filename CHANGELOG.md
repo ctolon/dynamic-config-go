@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-26
+
 The first stable release. The API is frozen, every guarantee in the
 documentation is a test, and the compatibility policy in
 [docs/compatibility.md](docs/compatibility.md) says what will and will not
@@ -188,6 +190,7 @@ something together.
 - Documentation covering design, concurrency, reloading, Kubernetes,
   security, migration from Viper, and troubleshooting.
 
-[Unreleased]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ctolon/dynamic-config-go/compare/v1.0.0...HEAD
 [0.1.0]: https://github.com/ctolon/dynamic-config-go/releases/tag/v0.1.0
 [0.1.1]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.0...v0.1.1
+[1.0.0]: https://github.com/ctolon/dynamic-config-go/compare/v0.1.1...v1.0.0
